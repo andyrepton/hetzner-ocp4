@@ -54,10 +54,42 @@
   failed_when: false
   check_mode: false
 
-- name: Fail if the node doesn't exist
+- name: Record whether the node object still exists
+  ansible.builtin.set_fact:
+    remove_node_node_exists: "{{ remove_node_get.rc == 0 }}"
+
+# A removal that failed partway leaves the node object already deleted while
+# the libvirt domain, DHCP reservation and haproxy backend are all still
+# present. Refusing outright in that state makes the playbook unable to
+# finish its own job, so the target is "absent everywhere" rather than
+# "present in the cluster": only fail when there is genuinely nothing left
+# to clean up.
+- name: Check whether the libvirt domain still exists
+  ansible.builtin.command: "virsh dominfo {{ cluster_name }}-{{ remove_node_name }}"
+  register: remove_node_dominfo_early
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail only if neither the node nor its VM exists
   ansible.builtin.fail:
-    msg: "No node named {{ remove_node_name }} in this cluster."
-  when: remove_node_get.rc != 0
+    msg: >-
+      No node named {{ remove_node_name }} in this cluster, and no libvirt
+      domain {{ cluster_name }}-{{ remove_node_name }} either - nothing to
+      remove.
+  when:
+    - not remove_node_node_exists
+    - remove_node_dominfo_early.rc != 0
+
+- name: Report resuming a partial removal
+  ansible.builtin.debug:
+    msg: >-
+      Node object {{ remove_node_name }} is already gone but libvirt domain
+      {{ cluster_name }}-{{ remove_node_name }} still exists - resuming a
+      partially-completed removal (VM, DHCP reservation, haproxy backend).
+  when:
+    - not remove_node_node_exists
+    - remove_node_dominfo_early.rc == 0
 
 - name: Parse target node
   ansible.builtin.set_fact:
@@ -65,6 +97,7 @@
     remove_node_master_labels: "{{ remove_node_get.stdout | from_json
       | json_query(\"metadata.labels | keys(@)\")
       | select('match', '.*(master|control-plane).*') | list }}"
+  when: remove_node_node_exists
 
 - name: Refuse to operate on masters/control-plane nodes
   ansible.builtin.fail:
@@ -74,7 +107,9 @@
       compute nodes only - control-plane removal means etcd member
       management and quorum risk, which on a 3-node control plane is a
       footgun not worth automating. Not overridable by remove_node_force.
-  when: remove_node_master_labels | length > 0
+  when:
+    - remove_node_node_exists
+    - remove_node_master_labels | length > 0
 
 - name: Refuse on a node name outside the compute-<id> naming scheme
   ansible.builtin.fail:
@@ -139,7 +174,9 @@
 ###############################################################################
 
 - name: Cordon and drain {{ remove_node_name }}
-  when: not ansible_check_mode
+  when:
+    - not ansible_check_mode
+    - remove_node_node_exists
   block:
 
     - name: Cordon {{ remove_node_name }}
@@ -175,17 +212,34 @@
       ansible.builtin.command: "virsh destroy {{ remove_node_domain }}"
       when: remove_node_domstate.rc == 0 and 'running' in remove_node_domstate.stdout
 
-    - name: Undefine, leaving storage in place, {{ remove_node_domain }}
-      ansible.builtin.command: "virsh undefine {{ remove_node_domain }}"
-      when:
-        - remove_node_domstate.rc == 0
-        - not remove_node_destroy_storage
+    # --nvram is required or undefine refuses outright on these domains:
+    # create-vm.yml defines them with UEFI firmware, which gives each one an
+    # nvram file that libvirt will not orphan silently.
+    #
+    # --remove-all-storage is deliberately NOT used: create-vm.yml writes the
+    # qcow2 straight to {{ coreos_path }} as a plain file rather than creating
+    # a libvirt storage-pool volume, and undefine refuses to delete disks it
+    # does not manage ("Storage volume 'vda' is not managed by libvirt").
+    # The disk is removed explicitly below instead.
+    - name: Undefine {{ remove_node_domain }}
+      ansible.builtin.command: "virsh undefine {{ remove_node_domain }} --nvram"
+      when: remove_node_domstate.rc == 0
 
-    - name: Undefine, removing storage, {{ remove_node_domain }}
-      ansible.builtin.command: "virsh undefine {{ remove_node_domain }} --remove-all-storage"
-      when:
-        - remove_node_domstate.rc == 0
-        - remove_node_destroy_storage
+    - name: Find the domain's disk images
+      ansible.builtin.find:
+        paths: "{{ coreos_path }}"
+        patterns: "{{ remove_node_domain }}.qcow2"
+      register: remove_node_disks
+      when: remove_node_destroy_storage
+
+    - name: Remove the domain's disk images
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ remove_node_disks.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: remove_node_destroy_storage
 
 ###############################################################################
 # Remove the DHCP reservation
