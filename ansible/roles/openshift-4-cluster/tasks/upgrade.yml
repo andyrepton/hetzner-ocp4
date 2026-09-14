@@ -189,7 +189,7 @@
             + (['--allow-explicit-upgrade'] if openshift_upgrade_allow_explicit_upgrade else [])
             + (['--force'] if openshift_upgrade_force else [])
           }}
-      register: trigger_upgrade
+      register: trigger_upgrade_pinned
       when: openshift_upgrade_mode == 'pinned'
 
     - name: "Trigger upgrade: latest update in current channel"
@@ -199,12 +199,17 @@
             [upgrade_oc_bin, 'adm', 'upgrade', '--to-latest=true', '--kubeconfig', upgrade_kubeconfig_path]
             + (['--force'] if openshift_upgrade_force else [])
           }}
-      register: trigger_upgrade
+      register: trigger_upgrade_latest
       when: openshift_upgrade_mode == 'latest'
 
+    # Both trigger tasks must register to *different* variables: a skipped
+    # task still registers its (skip) result, so sharing one name means
+    # whichever task is skipped silently overwrites the one that actually
+    # ran, and the result has no stdout_lines at all.
     - name: Upgrade triggered
       ansible.builtin.debug:
-        msg: "{{ trigger_upgrade.stdout_lines }}"
+        msg: "{{ (trigger_upgrade_pinned if openshift_upgrade_mode == 'pinned'
+                  else trigger_upgrade_latest).stdout_lines | default([]) }}"
 
     - name: Wait for upgrade to complete
       ansible.builtin.command: >
