@@ -93,3 +93,16 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# --- Add-compute-node settings (used by tasks/add-compute-node.yml / 06-add-compute-node.yml) ---
+# Set true to add a node even when pre-flight health checks fail (degraded
+# ClusterOperators, not-Ready nodes, etc). Prefer fixing the underlying
+# issue first - see docs/operations/adding-a-node.md.
+add_node_force: false
+# Minimum free space required on coreos_path before creating a new node.
+add_node_min_free_disk_gb: 50
+# How long to wait for CSR approval + node Ready: retries * delay seconds.
+# Kubelet-serving CSRs rotate roughly hourly if never approved, so this
+# stays well inside that.
+add_node_csr_wait_retries: 60
+add_node_csr_wait_delay: 20

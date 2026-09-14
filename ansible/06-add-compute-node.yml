@@ -1,0 +1,19 @@
+---
+# Adds one compute node to an already-running cluster (or adopts an
+# existing-but-not-wired-up libvirt VM). See docs/operations/adding-a-node.md.
+#
+# Usage:
+#   ./ansible/06-add-compute-node.yml                          # next available id
+#   ./ansible/06-add-compute-node.yml -e add_node_id=2          # target/adopt a specific id
+#   ./ansible/06-add-compute-node.yml --check                   # pre-flight only
+- name: Add a compute node to the cluster
+  hosts: host
+  gather_facts: true
+  vars_files:
+    - ../cluster.yml
+
+  tasks:
+    - name: Add compute node
+      ansible.builtin.import_role:
+        name: openshift-4-cluster
+        tasks_from: add-compute-node.yml

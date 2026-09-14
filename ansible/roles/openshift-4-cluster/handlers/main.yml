@@ -4,3 +4,11 @@
 
 - name: reload firewalld
   command: 'firewall-cmd --reload'
+
+- name: Restart load balancer
+  ansible.builtin.systemd:
+    name: "openshift-4-loadbalancer-{{ cluster_name }}.service"
+    state: restarted
+  # Restarting briefly drops in-flight connections through 80/443/6443.
+  # Expected and brief - see docs/operations/adding-a-node.md /
+  # removing-a-node.md, whichever task file notified this handler.

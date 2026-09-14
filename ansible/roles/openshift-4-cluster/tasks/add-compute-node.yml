@@ -1,0 +1,366 @@
+---
+# Adds one compute node to an already-running cluster, or "adopts" one that
+# already exists as a libvirt domain but was never wired up correctly (e.g.
+# missing its DHCP reservation - see docs/operations/adding-a-node.md for
+# why that happens and how to spot it).
+#
+# Node id/name/MAC/IP are derived from observed state (existing libvirt
+# domains + existing network DHCP reservations), never from compute_count -
+# a stale/wrong compute_count is exactly what causes orphaned nodes.
+#
+# Safe to re-run: if the target VM already exists, VM creation is skipped
+# entirely (disk, ignition, domain define/start) but the DHCP reservation,
+# haproxy backend, CSR approval and Ready-wait still run - this is what
+# makes "adopt an existing VM" and "idempotent re-run" the same code path.
+#
+# Run with --check for pre-flight only: reports the derived name/MAC/IP and
+# whether pre-flight passes, without mutating anything.
+
+- name: Refuse on IPv6/dual-stack clusters (not yet supported by this playbook)
+  ansible.builtin.fail:
+    msg: >-
+      ip_families includes IPv6 ({{ ip_families }}). This playbook only
+      derives IPv4 addressing/DHCP reservations/haproxy backends -  adding a
+      node on a dual-stack or IPv6 cluster needs the DUID-based IPv6 DHCP
+      path (see network.xml.j2) implemented first. Refusing rather than
+      doing a silent IPv4-only job on a dual-stack cluster.
+  when: "'IPv6' in ip_families"
+
+- name: Locate openshift client for {{ openshift_version }}
+  ansible.builtin.stat:
+    path: "/opt/openshift-client-{{ openshift_version }}/oc"
+  register: add_node_oc_stat
+  check_mode: false
+
+- name: Fail if the openshift client is missing
+  ansible.builtin.fail:
+    msg: >-
+      /opt/openshift-client-{{ openshift_version }}/oc not found - run
+      02-create-cluster.yml (or download-openshift-artifacts.yml) first.
+  when: not add_node_oc_stat.stat.exists
+
+- name: Set oc invocation facts
+  ansible.builtin.set_fact:
+    add_node_oc: "/opt/openshift-client-{{ openshift_version }}/oc --kubeconfig {{ openshift_install_dir }}/auth/kubeconfig"
+
+###############################################################################
+# Pre-flight
+###############################################################################
+
+- name: Get ClusterVersion
+  ansible.builtin.command: "{{ add_node_oc }} get clusterversion version -o json"
+  register: add_node_cv
+  changed_when: false
+  check_mode: false
+
+- name: Get ClusterOperators
+  ansible.builtin.command: "{{ add_node_oc }} get clusteroperators -o json"
+  register: add_node_co
+  changed_when: false
+  check_mode: false
+
+- name: Get Nodes
+  ansible.builtin.command: "{{ add_node_oc }} get nodes -o json"
+  register: add_node_nodes
+  changed_when: false
+  check_mode: false
+
+- name: Check free disk space on {{ coreos_path }}
+  ansible.builtin.command: "df --output=avail -B G {{ coreos_path }}"
+  register: add_node_disk_free
+  changed_when: false
+  check_mode: false
+
+- name: Get host free memory
+  ansible.builtin.setup:
+    gather_subset: ['!all', 'mem']
+  check_mode: false
+
+- name: Evaluate pre-flight facts
+  ansible.builtin.set_fact:
+    add_node_cv_json: "{{ add_node_cv.stdout | from_json }}"
+    add_node_degraded_operators: "{{ (add_node_co.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Degraded' && status=='True']].metadata.name\") }}"
+    add_node_unavailable_operators: "{{ (add_node_co.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Available' && status=='False']].metadata.name\") }}"
+    add_node_not_ready_nodes: "{{ (add_node_nodes.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Ready' && status!='True']].metadata.name\") }}"
+    add_node_disk_free_gb: "{{ (add_node_disk_free.stdout_lines[-1] | regex_replace('[^0-9]', '')) | int }}"
+    add_node_mem_free_mb: "{{ ansible_memory_mb.nocache.free | default(ansible_memory_mb.real.free) }}"
+
+- name: Evaluate ClusterVersion Available condition
+  ansible.builtin.set_fact:
+    add_node_cv_available: "{{ (add_node_cv_json.status.conditions | selectattr('type', 'equalto', 'Available')
+      | map(attribute='status') | first | default('Unknown')) == 'True' }}"
+
+- name: Build list of pre-flight failures
+  ansible.builtin.set_fact:
+    add_node_preflight_failures: >-
+      {{
+        ([] if add_node_cv_available else ['ClusterVersion Available condition is not True'])
+        + (['ClusterOperators degraded: ' + (add_node_degraded_operators | join(', '))]
+          if add_node_degraded_operators | length > 0 else [])
+        + (['ClusterOperators unavailable: ' + (add_node_unavailable_operators | join(', '))]
+          if add_node_unavailable_operators | length > 0 else [])
+        + (['Nodes not Ready: ' + (add_node_not_ready_nodes | join(', '))]
+          if add_node_not_ready_nodes | length > 0 else [])
+        + (['Only ' ~ add_node_disk_free_gb ~ 'G free on ' ~ coreos_path ~ ', need at least '
+          ~ add_node_min_free_disk_gb ~ 'G']
+          if add_node_disk_free_gb | int < add_node_min_free_disk_gb | int else [])
+        + (['Only ' ~ add_node_mem_free_mb ~ 'MB free memory on the host, need at least '
+          ~ compute_memory_size ~ compute_memory_unit]
+          if add_node_mem_free_mb | int < compute_memory_size | int else [])
+      }}
+
+- name: Report pre-flight status
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Pre-flight checks passed.' if add_node_preflight_failures | length == 0
+         else 'Pre-flight checks FAILED: ' ~ (add_node_preflight_failures | join(' | ')) }}
+
+- name: Refuse to start - pre-flight checks failed
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to add a node: {{ add_node_preflight_failures | join('; ') }}.
+      Resolve the underlying issue(s) first - or re-run with
+      -e add_node_force=true to override (not recommended).
+  when:
+    - add_node_preflight_failures | length > 0
+    - not add_node_force
+
+###############################################################################
+# Derive target node identity from observed state
+###############################################################################
+
+- name: List existing compute VMs
+  ansible.builtin.command: "virsh list --all --name"
+  register: add_node_virsh_list
+  changed_when: false
+  check_mode: false
+
+- name: Get live network config (for existing DHCP reservations)
+  ansible.builtin.command: "virsh net-dumpxml {{ cluster_name }}"
+  register: add_node_net_xml
+  changed_when: false
+  check_mode: false
+
+- name: Derive existing compute ids from libvirt domains and DHCP reservations
+  ansible.builtin.set_fact:
+    add_node_existing_vm_ids: "{{ add_node_virsh_list.stdout_lines
+      | select('match', '^' ~ cluster_name ~ '-compute-[0-9]+$')
+      | map('regex_replace', '^' ~ cluster_name ~ '-compute-([0-9]+)$', '\\1') | map('int') | list }}"
+    add_node_existing_dhcp_ids: "{{ add_node_net_xml.stdout
+      | regex_findall(\"name='compute-([0-9]+)\\.\" ~ vn_internal_domain | regex_escape ~ \"'\") | map('int') | list }}"
+
+- name: Set target compute id
+  ansible.builtin.set_fact:
+    add_node_id: "{{ add_node_id | default(
+      ((add_node_existing_vm_ids + add_node_existing_dhcp_ids) | max + 1)
+      if (add_node_existing_vm_ids + add_node_existing_dhcp_ids) | length > 0 else 0) }}"
+
+- name: Derive node identity
+  ansible.builtin.set_fact:
+    add_node_name: "{{ cluster_name }}-compute-{{ add_node_id }}"
+    add_node_short_name: "compute-{{ add_node_id }}"
+    add_node_fqdn: "compute-{{ add_node_id }}.{{ vn_internal_domain }}"
+    add_node_mac: "52:54:00:{{ '%02x' % vn_subnet.split('.')[1]|int }}:{{ '%02x' % vn_subnet.split('.')[2]|int }}:{{ '%02x' % (10 + master_count|int + add_node_id|int) }}"     # noqa line-length
+    add_node_ipv4: "{{ vn_subnet.split('.')[:3] | join('.') }}.{{ 10 + master_count|int + add_node_id|int }}"
+
+- name: Check whether the target VM already exists (adopt vs create)
+  ansible.builtin.command: "virsh dominfo {{ add_node_name }}"
+  register: add_node_vm_exists
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Set adopt_mode fact
+  ansible.builtin.set_fact:
+    add_node_adopt_mode: "{{ add_node_vm_exists.rc == 0 }}"
+
+- name: Refuse if the derived MAC/IP is already reserved for a different node
+  ansible.builtin.fail:
+    msg: >-
+      {{ add_node_mac }} / {{ add_node_ipv4 }} (derived for {{ add_node_name }})
+      is already reserved in the network for a different node - refusing to
+      collide. Check `virsh net-dumpxml {{ cluster_name }}`.
+  when:
+    - not add_node_adopt_mode
+    - add_node_id | int in add_node_existing_dhcp_ids
+
+- name: Report derived node identity
+  ansible.builtin.debug:
+    msg: >-
+      Target: {{ add_node_name }} ({{ add_node_fqdn }}), MAC {{ add_node_mac }},
+      IP {{ add_node_ipv4 }}. Mode: {{ 'adopt (VM already exists)' if add_node_adopt_mode else 'create new VM' }}.
+
+- name: Pre-flight only - stop here in --check mode
+  ansible.builtin.debug:
+    msg: "--check requested: pre-flight and identity derivation only, no changes made."
+  when: ansible_check_mode
+
+###############################################################################
+# Create the VM (skipped entirely in adopt mode)
+###############################################################################
+
+- name: Create VM
+  when:
+    - not ansible_check_mode
+    - not add_node_adopt_mode
+  block:
+
+    - name: Fetch fresh worker pointer ignition from the running cluster
+      ansible.builtin.command: >
+        {{ add_node_oc }} extract -n openshift-machine-api
+        secret/worker-user-data-managed --keys=userData --to=-
+      register: add_node_pointer_ignition
+      changed_when: false
+
+    - name: Write fresh pointer ignition
+      ansible.builtin.copy:
+        content: "{{ add_node_pointer_ignition.stdout }}"
+        dest: "{{ openshift_install_dir }}/{{ add_node_short_name }}-pointer.ign"
+        mode: '0644'
+
+    - name: Create compute VM {{ add_node_name }}
+      ansible.builtin.include_tasks: create-vm.yml
+      vars:
+        vm_instance_name: "{{ add_node_name }}"
+        vm_network: "{{ cluster_name }}"
+        vm_ignition_file: "{{ openshift_install_dir }}/{{ add_node_short_name }}-pointer.ign"
+        vm_mac_address: "{{ add_node_mac }}"
+        vm_vcpu: "{{ compute_vcpu }}"
+        vm_special_cpu: "{{ compute_special_cpu | default('') }}"
+        vm_memory_size: "{{ compute_memory_size }}"
+        vm_memory_unit: "{{ compute_memory_unit }}"
+        vm_root_disk_size: "{{ compute_root_disk_size }}"
+
+###############################################################################
+# DHCP reservation - incremental, verified live
+###############################################################################
+
+- name: Add DHCP reservation for {{ add_node_name }}
+  ansible.builtin.command: >
+    virsh net-update {{ cluster_name }} add ip-dhcp-host
+    "<host mac='{{ add_node_mac }}' name='{{ add_node_fqdn }}' ip='{{ add_node_ipv4 }}'/>"
+    --live --config
+  when:
+    - not ansible_check_mode
+    - add_node_id | int not in add_node_existing_dhcp_ids
+  register: add_node_dhcp_result
+
+- name: Verify DHCP reservation took live effect
+  ansible.builtin.command: "virsh net-dumpxml {{ cluster_name }}"
+  register: add_node_net_xml_after
+  changed_when: false
+  when:
+    - not ansible_check_mode
+    - add_node_dhcp_result is changed
+
+- name: Fail if the live DHCP reservation didn't take
+  ansible.builtin.fail:
+    msg: "DHCP reservation for {{ add_node_mac }} not present in live network config after net-update --live."
+  when:
+    - not ansible_check_mode
+    - add_node_dhcp_result is changed
+    - add_node_mac not in add_node_net_xml_after.stdout
+
+###############################################################################
+# haproxy backend - rebuilt from observed state, not compute_count
+###############################################################################
+
+- name: Rebuild haproxy backend list from observed state
+  when: not ansible_check_mode
+  block:
+
+    - name: Re-list compute VMs (post-create)
+      ansible.builtin.command: "virsh list --all --name"
+      register: add_node_virsh_list_after
+      changed_when: false
+
+    - name: Derive haproxy node list from observed state
+      ansible.builtin.set_fact:
+        add_node_lb_compute_ids: "{{ (add_node_virsh_list_after.stdout_lines
+          | select('match', '^' ~ cluster_name ~ '-compute-[0-9]+$')
+          | map('regex_replace', '^' ~ cluster_name ~ '-compute-([0-9]+)$', '\\1') | map('int') | list) | unique | sort }}"
+
+    - name: Build masters list for haproxy template
+      ansible.builtin.set_fact:
+        add_node_lb_masters: "{{ add_node_lb_masters | default([]) + [{
+          'name': 'master-' ~ item,
+          'ipv4': vn_subnet.split('.')[:3] | join('.') ~ '.' ~ (10 + item|int),
+          }] }}"
+      loop: "{{ range(0, master_count|int) | list }}"
+
+    - name: Build workers list for haproxy template
+      ansible.builtin.set_fact:
+        add_node_lb_workers: "{{ add_node_lb_workers | default([]) + [{
+          'name': 'compute-' ~ item,
+          'ipv4': vn_subnet.split('.')[:3] | join('.') ~ '.' ~ (10 + master_count|int + item|int),
+          }] }}"
+      loop: "{{ add_node_lb_compute_ids }}"
+
+    - name: Set nodes fact for haproxy template
+      ansible.builtin.set_fact:
+        nodes:
+          bootstrap: []
+          masters: "{{ add_node_lb_masters }}"
+          workers: "{{ add_node_lb_workers }}"
+
+    - name: Build IPv4 listen facts (matches create-network.yml)
+      ansible.builtin.set_fact:
+        ipv4_listen_private:
+          - "{{ vn_subnet.split('.')[:3] | join('.') }}.1"
+        ipv4_listen_public:
+          - "{{ listen_address }}"
+      when: "'IPv4' in ip_families"
+
+    - name: Render haproxy config from observed state
+      ansible.builtin.set_fact:
+        add_node_lb_haproxy_cfg: "{{ lookup('template', 'templates/haproxy.conf.j2') }}"
+
+    - name: Write haproxy EnvironmentFile
+      ansible.builtin.copy:
+        content: "HAPROXY_CFG=\"{{ add_node_lb_haproxy_cfg }}\"\n"
+        dest: "/etc/sysconfig/openshift-4-loadbalancer-{{ cluster_name }}.env"
+        mode: '0644'
+      # Only restarts (briefly drops in-flight connections through
+      # 80/443/6443) when the rendered config actually changed - see
+      # handlers/main.yml and docs/operations/adding-a-node.md.
+      notify: Restart load balancer
+
+###############################################################################
+# CSR approval - two rounds, polled (never a blanket pause)
+###############################################################################
+
+- name: Approve CSRs and wait for node to go Ready, {{ add_node_short_name }}
+  when: not ansible_check_mode
+  block:
+
+    - name: Poll for and approve CSRs, wait for node Ready
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ add_node_oc }} get csr -o json \
+          | python3 -c '
+        import json, sys
+        d = json.load(sys.stdin)
+        for i in d["items"]:
+            u = i["spec"]["username"]
+            conds = i.get("status", {}).get("conditions", [])
+            if conds:
+                continue
+            if u == "system:serviceaccount:openshift-machine-config-operator:node-bootstrapper" or \
+               u == "system:node:{{ add_node_short_name }}":
+                print(i["metadata"]["name"])
+        ' \
+          | xargs --no-run-if-empty -n1 {{ add_node_oc }} adm certificate approve
+        {{ add_node_oc }} get node {{ add_node_short_name }} \
+          -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+      register: add_node_ready_poll
+      until: add_node_ready_poll.stdout is search('True')
+      retries: "{{ add_node_csr_wait_retries }}"
+      delay: "{{ add_node_csr_wait_delay }}"
+      changed_when: false
+
+    - name: Node is Ready
+      ansible.builtin.debug:
+        msg: "{{ add_node_short_name }} ({{ add_node_ipv4 }}) is Ready."
