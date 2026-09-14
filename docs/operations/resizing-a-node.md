@@ -28,10 +28,13 @@ elsewhere in this repo).
 Serial - one node at a time, always waiting for the previous one to be back
 and `Ready` before touching the next, whether you list one node or several:
 
-1. Cordon, then drain (`--ignore-daemonsets`, **not**
-   `--delete-emptydir-data` - the node is coming back, not being removed,
-   and its local disk survives a reboot, so there's no reason to force
-   that data away).
+1. Cordon, then drain (`--ignore-daemonsets --delete-emptydir-data`). The
+   emptyDir flag is mandatory rather than a choice: `oc adm drain` refuses
+   outright if any pod has an emptyDir volume, and OpenShift's own platform
+   pods — prometheus, alertmanager, image-registry, metrics-server — all use
+   them. Draining reschedules those pods onto another node and an emptyDir
+   never follows its pod, so the data is discarded either way; omitting the
+   flag blocks the drain rather than preserving anything.
 2. `virsh shutdown` (graceful ACPI shutdown), polled until the domain
    actually reaches `shutdown` state.
 3. Memory and/or vCPU count are changed on the offline domain via
@@ -40,8 +43,21 @@ and `Ready` before touching the next, whether you list one node or several:
    maximum - in both directions, current never exceeds max at any single
    step, which is what `--config` on an offline domain requires.
 4. `virsh start`, polled until running.
-5. Polled until the node reports `Ready` again in the cluster.
+5. Polled until the node's `bootID` has **changed** *and* it reports `Ready`.
+   Both halves are needed. Waiting on `Ready` alone is racy: for about the
+   node-monitor grace period (~40s) after a node disappears, its object still
+   advertises the `Ready=True` it had before shutting down. A naive poll
+   therefore succeeds immediately, uncordons a node that has not actually
+   come back, and lets the loop start draining the next one - briefly taking
+   two nodes out at once. `bootID` is rewritten by the kernel on every boot,
+   so a change in it cannot be stale.
 6. Uncordon.
+
+If any step between the cordon and the uncordon fails, a `rescue` uncordons
+the node before re-raising the error. The run still fails loudly - but it
+fails with the node able to take work again, rather than silently leaving the
+cluster one worker short until someone notices and runs `oc adm uncordon` by
+hand.
 
 Each run reminds you to update the matching `cluster.yml` variable
 (`master_vcpu`/`master_memory_size`/`master_memory_unit` or

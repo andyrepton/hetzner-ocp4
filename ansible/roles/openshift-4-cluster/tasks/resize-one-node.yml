@@ -22,11 +22,34 @@
   ansible.builtin.command: "{{ resize_node_oc }} adm cordon {{ resize_node_name }}"
   changed_when: true
 
+# --delete-emptydir-data is required, not merely convenient: `oc adm drain`
+# refuses outright if any pod has an emptyDir, and OpenShift's own platform
+# pods (prometheus, alertmanager, image-registry, metrics-server) all use
+# them - so without it the drain fails on any realistic cluster. The data is
+# discarded either way, because draining reschedules those pods onto another
+# node and an emptyDir never follows its pod; withholding the flag blocks the
+# drain rather than preserving anything. remove-compute-node.yml already
+# passes it for the same reason.
 - name: Drain {{ resize_node_name }}
   ansible.builtin.command: >
     {{ resize_node_oc }} adm drain {{ resize_node_name }}
-    --ignore-daemonsets --timeout={{ resize_node_drain_timeout }}
+    --ignore-daemonsets --delete-emptydir-data
+    --timeout={{ resize_node_drain_timeout }}
   changed_when: true
+
+# Captured before the shutdown so the restart can be detected positively.
+# Waiting on the Ready condition alone is racy: for roughly the node-monitor
+# grace period (~40s) after a node goes away, its object still advertises the
+# Ready=True it had before shutting down, so a naive poll succeeds instantly,
+# uncordons a node that has not actually returned, and lets the loop move on
+# to drain the next one - briefly taking two nodes out at once. bootID is
+# rewritten by the kernel on every boot, so a change in it cannot be stale.
+- name: Record pre-shutdown bootID for {{ resize_node_name }}
+  ansible.builtin.command: >
+    {{ resize_node_oc }} get node {{ resize_node_name }}
+    -o jsonpath='{.status.nodeInfo.bootID}'
+  register: resize_node_boot_id_before
+  changed_when: false
 
 - name: Shutdown VM {{ resize_node_domain }}
   community.libvirt.virt:
@@ -123,12 +146,18 @@
   retries: "{{ resize_node_wait_retries }}"
   delay: "{{ resize_node_wait_delay }}"
 
-- name: Wait for node to report Ready, {{ resize_node_name }}
+# Both halves matter: a changed bootID proves the node actually rebooted and
+# re-registered (so Ready can no longer be a stale pre-shutdown value), and
+# Ready=True proves it is fit to take work again.
+- name: Wait for node to reboot and report Ready, {{ resize_node_name }}
   ansible.builtin.command: >
     {{ resize_node_oc }} get node {{ resize_node_name }}
-    -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+    -o jsonpath='{.status.nodeInfo.bootID}{"|"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
   register: resize_node_ready_poll
-  until: resize_node_ready_poll.stdout is search('True')
+  until:
+    - resize_node_ready_poll.stdout.split('|')[0] | default('', true) | length > 0
+    - resize_node_ready_poll.stdout.split('|')[0] != resize_node_boot_id_before.stdout
+    - resize_node_ready_poll.stdout.split('|')[1] | default('') == 'True'
   retries: "{{ resize_node_wait_retries }}"
   delay: "{{ resize_node_wait_delay }}"
   changed_when: false
@@ -145,3 +174,7 @@
          else 'compute_memory_size/compute_memory_unit' }}
       {{ 'and master_vcpu' if resize_node_name is match('^master-') else 'and compute_vcpu' }}
       in cluster.yml to match, so a future node add/recreate stays consistent.
+
+# Nothing below this line: the caller (resize-node.yml) wraps this whole file
+# in a rescue that uncordons, so anything added after the uncordon above would
+# run outside that protection's useful range.

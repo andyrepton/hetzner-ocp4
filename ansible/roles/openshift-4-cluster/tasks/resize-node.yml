@@ -137,9 +137,34 @@
 # sequential - never parallel)
 ###############################################################################
 
+# The rescue exists because a failure anywhere between the cordon and the
+# uncordon otherwise leaves the node cordoned and the cluster one worker
+# short, with nothing saying so - the operator has to notice and run
+# `oc adm uncordon` by hand. Observed for real when a drain failed partway.
+# The rescue uncordons and then re-raises, so the run still fails loudly; it
+# restores schedulability rather than papering over the error.
 - name: Resize each node
-  ansible.builtin.include_tasks: resize-one-node.yml
   loop: "{{ resize_node_names }}"
   loop_control:
     loop_var: resize_node_name
   when: not ansible_check_mode
+  block:
+
+    - name: Resize one node, {{ resize_node_name }}
+      ansible.builtin.include_tasks: resize-one-node.yml
+
+  rescue:
+
+    - name: Uncordon after a failed resize of {{ resize_node_name }}
+      ansible.builtin.command: "{{ resize_node_oc }} adm uncordon {{ resize_node_name }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Re-raise the original failure for {{ resize_node_name }}
+      ansible.builtin.fail:
+        msg: >-
+          Resize of {{ resize_node_name }} failed - the node has been
+          uncordoned so it can take work again, but it may not have been
+          resized, and any later nodes in resize_node_names were not
+          attempted. Original error:
+          {{ ansible_failed_result.msg | default('see the task output above') }}
