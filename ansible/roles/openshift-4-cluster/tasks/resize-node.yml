@@ -1,0 +1,145 @@
+---
+# Resizes CPU and/or memory for one or more existing nodes (master or
+# compute). One node at a time, serial, never parallel - each node is fully
+# drained, shut down, resized, started, and waited-Ready before the next
+# one is touched. See docs/operations/resizing-a-node.md.
+#
+# Disk resize is out of scope - see the docs page for why.
+
+- name: Require resize_node_names
+  ansible.builtin.fail:
+    msg: >-
+      resize_node_names is required (a list), e.g.
+      -e '{"resize_node_names": ["compute-0"]}'. No default.
+  when: resize_node_names is not defined or resize_node_names | length == 0
+
+- name: Require at least one of vcpu/memory to resize
+  ansible.builtin.fail:
+    msg: >-
+      Set at least one of resize_node_vcpu or resize_node_memory_size -
+      nothing to resize otherwise.
+  when: resize_node_vcpu is not defined and resize_node_memory_size is not defined
+
+- name: Locate openshift client for {{ openshift_version }}
+  ansible.builtin.stat:
+    path: "/opt/openshift-client-{{ openshift_version }}/oc"
+  register: resize_node_oc_stat
+  check_mode: false
+
+- name: Fail if the openshift client is missing
+  ansible.builtin.fail:
+    msg: >-
+      /opt/openshift-client-{{ openshift_version }}/oc not found - run
+      02-create-cluster.yml first.
+  when: not resize_node_oc_stat.stat.exists
+
+- name: Set oc invocation facts
+  ansible.builtin.set_fact:
+    resize_node_oc: "/opt/openshift-client-{{ openshift_version }}/oc --kubeconfig {{ openshift_install_dir }}/auth/kubeconfig"
+
+###############################################################################
+# Cluster-wide pre-flight (once, before touching any node)
+###############################################################################
+
+- name: Get ClusterVersion
+  ansible.builtin.command: "{{ resize_node_oc }} get clusterversion version -o json"
+  register: resize_node_cv
+  changed_when: false
+  check_mode: false
+
+- name: Get ClusterOperators
+  ansible.builtin.command: "{{ resize_node_oc }} get clusteroperators -o json"
+  register: resize_node_co
+  changed_when: false
+  check_mode: false
+
+- name: Get Nodes
+  ansible.builtin.command: "{{ resize_node_oc }} get nodes -o json"
+  register: resize_node_all_nodes
+  changed_when: false
+  check_mode: false
+
+- name: Evaluate pre-flight facts
+  ansible.builtin.set_fact:
+    resize_node_cv_json: "{{ resize_node_cv.stdout | from_json }}"
+    resize_node_degraded_operators: "{{ (resize_node_co.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Degraded' && status=='True']].metadata.name\") }}"
+    resize_node_unavailable_operators: "{{ (resize_node_co.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Available' && status=='False']].metadata.name\") }}"
+    resize_node_not_ready_nodes: "{{ (resize_node_all_nodes.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Ready' && status!='True']].metadata.name\") }}"
+
+- name: Evaluate ClusterVersion Available condition
+  ansible.builtin.set_fact:
+    resize_node_cv_available: "{{ (resize_node_cv_json.status.conditions | selectattr('type', 'equalto', 'Available')
+      | map(attribute='status') | first | default('Unknown')) == 'True' }}"
+
+- name: Build list of pre-flight failures
+  ansible.builtin.set_fact:
+    resize_node_preflight_failures: >-
+      {{
+        ([] if resize_node_cv_available else ['ClusterVersion Available condition is not True'])
+        + (['ClusterOperators degraded: ' + (resize_node_degraded_operators | join(', '))]
+          if resize_node_degraded_operators | length > 0 else [])
+        + (['ClusterOperators unavailable: ' + (resize_node_unavailable_operators | join(', '))]
+          if resize_node_unavailable_operators | length > 0 else [])
+        + (['Nodes not Ready: ' + (resize_node_not_ready_nodes | join(', '))]
+          if resize_node_not_ready_nodes | length > 0 else [])
+      }}
+
+- name: Report pre-flight status
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Pre-flight checks passed.' if resize_node_preflight_failures | length == 0
+         else 'Pre-flight checks FAILED: ' ~ (resize_node_preflight_failures | join(' | ')) }}
+
+- name: Refuse to start - pre-flight checks failed
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to resize: {{ resize_node_preflight_failures | join('; ') }}.
+      Resolve first, or re-run with -e resize_node_force=true to override
+      (not recommended - you're about to take a node offline on top of an
+      already-unhealthy cluster).
+  when:
+    - resize_node_preflight_failures | length > 0
+    - not resize_node_force
+
+- name: Refuse on IPv6/dual-stack clusters (haproxy backend is unaffected here, but stay consistent)
+  ansible.builtin.fail:
+    msg: "ip_families includes IPv6 ({{ ip_families }}) - not supported by this playbook, same as adding/removing a node."
+  when: "'IPv6' in ip_families"
+
+- name: Validate node names
+  ansible.builtin.fail:
+    msg: >-
+      {{ item }} doesn't match the master-<id> or compute-<id> naming
+      scheme this repo uses - refusing (can't reliably derive its libvirt
+      domain).
+  loop: "{{ resize_node_names }}"
+  when: not (item is match('^(master|compute)-[0-9]+$'))
+
+- name: Report the plan
+  ansible.builtin.debug:
+    msg: >-
+      Will resize, one at a time: {{ resize_node_names }}.
+      {{ ('vCPUs -> ' ~ resize_node_vcpu ~ '. ') if resize_node_vcpu is defined else '' }}
+      {{ ('Memory -> ' ~ resize_node_memory_size ~ (resize_node_memory_unit | default('MiB')) ~ '.')
+         if resize_node_memory_size is defined else '' }}
+      Each node: cordon+drain -> shutdown -> resize -> start -> wait Ready -> uncordon.
+
+- name: Stop here in --check mode
+  ansible.builtin.debug:
+    msg: "--check requested: no changes made."
+  when: ansible_check_mode
+
+###############################################################################
+# Resize each node, one at a time (include_tasks + loop is inherently
+# sequential - never parallel)
+###############################################################################
+
+- name: Resize each node
+  ansible.builtin.include_tasks: resize-one-node.yml
+  loop: "{{ resize_node_names }}"
+  loop_control:
+    loop_var: resize_node_name
+  when: not ansible_check_mode

@@ -93,3 +93,15 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# --- Resize-node settings (used by tasks/resize-node.yml / 08-resize-node.yml) ---
+# Set true to resize even when pre-flight health checks fail. Prefer fixing
+# the underlying issue first - you're about to take a node offline on top
+# of an already-unhealthy cluster otherwise.
+resize_node_force: false
+# Passed to `oc adm drain --timeout`.
+resize_node_drain_timeout: "300s"
+# How long to wait for shutdown/start/Ready at each step: retries * delay
+# seconds.
+resize_node_wait_retries: 60
+resize_node_wait_delay: 10

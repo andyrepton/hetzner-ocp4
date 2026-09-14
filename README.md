@@ -312,6 +312,7 @@ In our setup, this will be `ansible/group_vars` and `ansible/host_vars`.
 |`ansible/02-create-cluster.yml`|Installation of your OpenShift 4 Cluster|
 |`ansible/03-stop-cluster.yml`|Stop all virtual machines related to your OpenShift 4 Cluster|
 |`ansible/04-start-cluster.yml`|Start all virtual machines related to your OpenShift 4 Cluster|
+|`ansible/08-resize-node.yml`|Resize CPU/memory for an existing node in your running OpenShift 4 Cluster. See [docs/operations/resizing-a-node.md](docs/operations/resizing-a-node.md)|
 |`ansible/99-destroy-cluster.yml`|Delete everything what is created via `ansible/02-create-cluster.yml`|
 |`ansible/renewal-certificate.yml`|Renewal your Let's encrypt certificate and replace everything in your OpenShift 4 Cluster. There is no automatically renew process, please run renew on your own behalf.|
 |`ansible/run-add-ons.yml`|Run all enabled add-ons agains your OpenShift 4 cluster|

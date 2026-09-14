@@ -1,0 +1,147 @@
+---
+# Resizes a single node: cordon+drain -> shutdown -> resize -> start ->
+# wait Ready -> uncordon. Included in a loop from resize-node.yml -
+# `resize_node_name` is the loop var for this one node.
+
+- name: Set derived identity for {{ resize_node_name }}
+  ansible.builtin.set_fact:
+    resize_node_domain: "{{ cluster_name }}-{{ resize_node_name }}"
+
+- name: Check the node exists in the cluster, {{ resize_node_name }}
+  ansible.builtin.command: "{{ resize_node_oc }} get node {{ resize_node_name }} -o name"
+  register: resize_node_get
+  changed_when: false
+  failed_when: false
+
+- name: Fail if the node doesn't exist, {{ resize_node_name }}
+  ansible.builtin.fail:
+    msg: "No node named {{ resize_node_name }} in this cluster."
+  when: resize_node_get.rc != 0
+
+- name: Cordon {{ resize_node_name }}
+  ansible.builtin.command: "{{ resize_node_oc }} adm cordon {{ resize_node_name }}"
+  changed_when: true
+
+- name: Drain {{ resize_node_name }}
+  ansible.builtin.command: >
+    {{ resize_node_oc }} adm drain {{ resize_node_name }}
+    --ignore-daemonsets --timeout={{ resize_node_drain_timeout }}
+  changed_when: true
+
+- name: Shutdown VM {{ resize_node_domain }}
+  community.libvirt.virt:
+    command: shutdown
+    name: "{{ resize_node_domain }}"
+
+- name: Wait for VM to reach shutdown state, {{ resize_node_domain }}
+  community.libvirt.virt:
+    name: "{{ resize_node_domain }}"
+    command: status
+  register: resize_node_shutdown_status
+  until: resize_node_shutdown_status.status == 'shutdown'
+  retries: "{{ resize_node_wait_retries }}"
+  delay: "{{ resize_node_wait_delay }}"
+
+###############################################################################
+# Apply the resize while offline. Max is set before current when growing,
+# current before max when shrinking, so the domain's offline XML never
+# needs current > max at any single step.
+###############################################################################
+
+- name: Resize memory for {{ resize_node_domain }}
+  when: resize_node_memory_size is defined
+  vars:
+    # virsh's own size args take a suffix directly (e.g. "16384MiB"), not a
+    # separate --unit flag. dominfo always reports in KiB regardless of
+    # what unit the domain was originally defined with, so convert our
+    # target to KiB too, purely to compare against it.
+    resize_node_kib_per_unit:
+      KiB: 1
+      MiB: 1024
+      GiB: 1048576
+    resize_node_target_kib: "{{ (resize_node_memory_size | int)
+      * resize_node_kib_per_unit[resize_node_memory_unit | default('MiB')] }}"
+    resize_node_size_with_suffix: "{{ resize_node_memory_size }}{{ resize_node_memory_unit | default('MiB') }}"
+  block:
+
+    - name: Get current max memory, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh dominfo {{ resize_node_domain }}"
+      register: resize_node_dominfo
+      changed_when: false
+
+    - name: Parse current max memory (KiB), {{ resize_node_domain }}
+      ansible.builtin.set_fact:
+        resize_node_current_maxmem_kib: "{{ resize_node_dominfo.stdout
+          | regex_search('Max memory:\\s+([0-9]+)', '\\1') | first | int }}"
+
+    - name: Grow maxmem first, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setmaxmem {{ resize_node_domain }} {{ resize_node_size_with_suffix }} --config"
+      when: resize_node_target_kib | int > resize_node_current_maxmem_kib | int
+
+    - name: Set current memory, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setmem {{ resize_node_domain }} {{ resize_node_size_with_suffix }} --config"
+
+    - name: Shrink maxmem after, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setmaxmem {{ resize_node_domain }} {{ resize_node_size_with_suffix }} --config"
+      when: resize_node_target_kib | int < resize_node_current_maxmem_kib | int
+
+- name: Resize vCPUs for {{ resize_node_domain }}
+  when: resize_node_vcpu is defined
+  block:
+
+    - name: Get current max vcpus, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh vcpucount {{ resize_node_domain }} --config --maximum"
+      register: resize_node_current_vcpu
+      changed_when: false
+
+    - name: Grow max vcpus first, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setvcpus {{ resize_node_domain }} {{ resize_node_vcpu }} --config --maximum"
+      when: resize_node_vcpu | int > (resize_node_current_vcpu.stdout | trim | int)
+
+    - name: Set current vcpus, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setvcpus {{ resize_node_domain }} {{ resize_node_vcpu }} --config"
+
+    - name: Shrink max vcpus after, {{ resize_node_domain }}
+      ansible.builtin.command: "virsh setvcpus {{ resize_node_domain }} {{ resize_node_vcpu }} --config --maximum"
+      when: resize_node_vcpu | int < (resize_node_current_vcpu.stdout | trim | int)
+
+###############################################################################
+# Start it back up and wait for it to rejoin
+###############################################################################
+
+- name: Start VM {{ resize_node_domain }}
+  community.libvirt.virt:
+    command: start
+    name: "{{ resize_node_domain }}"
+
+- name: Wait for VM to reach running state, {{ resize_node_domain }}
+  community.libvirt.virt:
+    name: "{{ resize_node_domain }}"
+    command: status
+  register: resize_node_running_status
+  until: resize_node_running_status.status == 'running'
+  retries: "{{ resize_node_wait_retries }}"
+  delay: "{{ resize_node_wait_delay }}"
+
+- name: Wait for node to report Ready, {{ resize_node_name }}
+  ansible.builtin.command: >
+    {{ resize_node_oc }} get node {{ resize_node_name }}
+    -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}'
+  register: resize_node_ready_poll
+  until: resize_node_ready_poll.stdout is search('True')
+  retries: "{{ resize_node_wait_retries }}"
+  delay: "{{ resize_node_wait_delay }}"
+  changed_when: false
+
+- name: Uncordon {{ resize_node_name }}
+  ansible.builtin.command: "{{ resize_node_oc }} adm uncordon {{ resize_node_name }}"
+  changed_when: true
+
+- name: Resized and Ready, {{ resize_node_name }}
+  ansible.builtin.debug:
+    msg: >-
+      {{ resize_node_name }} is back and Ready. Remember to update
+      {{ 'master_memory_size/master_memory_unit' if resize_node_name is match('^master-')
+         else 'compute_memory_size/compute_memory_unit' }}
+      {{ 'and master_vcpu' if resize_node_name is match('^master-') else 'and compute_vcpu' }}
+      in cluster.yml to match, so a future node add/recreate stays consistent.
