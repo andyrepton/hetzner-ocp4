@@ -225,14 +225,22 @@
       ansible.builtin.command: "virsh undefine {{ remove_node_domain }} --nvram"
       when: remove_node_domstate.rc == 0
 
-    - name: Find the domain's disk images
+    # The .ign goes with the disk. create-vm.yml writes one per domain and
+    # destroy-vm.yml removes both, but destroy-vm.yml only ever runs for ids
+    # within compute_count - so a node removed here and never replaced leaves
+    # its ignition behind forever, invisible until someone lists the images
+    # directory. Observed after removing compute-3: a full cluster destroy
+    # later still left ocp-compute-3.ign on disk.
+    - name: Find the domain's disk and ignition files
       ansible.builtin.find:
         paths: "{{ coreos_path }}"
-        patterns: "{{ remove_node_domain }}.qcow2"
+        patterns:
+          - "{{ remove_node_domain }}.qcow2"
+          - "{{ remove_node_domain }}.ign"
       register: remove_node_disks
       when: remove_node_destroy_storage
 
-    - name: Remove the domain's disk images
+    - name: Remove the domain's disk and ignition files
       ansible.builtin.file:
         path: "{{ item.path }}"
         state: absent
