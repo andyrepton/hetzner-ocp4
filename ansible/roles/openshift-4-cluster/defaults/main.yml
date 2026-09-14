@@ -39,7 +39,8 @@ compute_root_disk_size: '120G'
 
 fips: false
 
-vm_autostart: false
+# Restart VMs if the host Hetzner box restarts
+vm_autostart: true
 
 # Important: OpenShift version must match to RHEL CoreOS version!
 

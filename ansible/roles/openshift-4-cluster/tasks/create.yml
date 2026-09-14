@@ -1,5 +1,4 @@
 ---
-
 - name: Check add-ons.yml
   ansible.builtin.stat:
     path: "{{ playbook_dir }}/../add-ons.yml"
@@ -92,11 +91,27 @@
     src: "{{ ssh_public_key_location }}.pub"
   register: slurped_ssh_public_key
 
+- name: Check if cluster is already running
+  ansible.builtin.uri:
+    url: "https://api.{{ cluster_name }}.{{ public_domain }}:6443/readyz"
+    validate_certs: false
+    status_code:
+      - 200
+      - 500
+      - 503
+  register: api_is_running
+  ignore_errors: true
+
+- name: Set cluster_already_running fact
+  ansible.builtin.set_fact:
+    cluster_already_running: "{{ api_is_running.status is defined and api_is_running.status in [200, 500, 503] }}"
+
 - name: Create ignition files
   ansible.builtin.include_tasks: create-ignition.yml
   vars:
     ssh_public_key: "{{ slurped_ssh_public_key['content'] | b64decode }}"
   tags: ignition
+  when: not cluster_already_running
 
 - name: Create bootstrap node
   ansible.builtin.include_tasks: create-vm.yml
@@ -109,6 +124,7 @@
     vm_memory_size: 16384
     vm_memory_unit: 'MiB'
     vm_root_disk_size: '120G'
+  when: not cluster_already_running
 
 - name: Create master nodes
   ansible.builtin.include_tasks: create-vm.yml
@@ -123,6 +139,7 @@
     vm_memory_unit: "{{ master_memory_unit }}"
     vm_root_disk_size: "{{ master_root_disk_size }}"
   with_sequence: start=0 end="{{ master_count|int - 1 }}" stride=1
+  when: not cluster_already_running
 
 - name: Create compute node
   ansible.builtin.include_tasks: create-vm.yml
@@ -141,6 +158,6 @@
 
 - name: Include post installation tasks
   ansible.builtin.include_tasks: post-install.yml
-  tags: 
+  tags:
     - post-install
     - post-install-add-ons

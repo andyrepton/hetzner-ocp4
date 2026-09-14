@@ -37,20 +37,29 @@
     remote_src: true
     mode: '0644'
 
+- name: Check if vm is already defined
+  ansible.builtin.command: "virsh dominfo {{ vm_instance_name }}"
+  register: vm_is_defined
+  changed_when: false
+  failed_when: false
+
 - name: Debug - create /tmp/{{ vm_instance_name }}.virt.xml
   ansible.builtin.template:
     src: "vm.xml.j2"
     dest: "/tmp/{{ vm_instance_name }}.virt.xml"
     mode: 0664
+  when: vm_is_defined.rc != 0
 
 - name: Define VirtualMachine {{ vm_instance_name }}
   community.libvirt.virt:
     name: "{{ vm_instance_name }}"
     command: define
     xml: "{{ lookup('template', 'templates/vm.xml.j2') }}"
+  when: vm_is_defined.rc != 0
 
 - name: Start VirtualMachine {{ vm_instance_name }}
   community.libvirt.virt:
     name: "{{ vm_instance_name }}"
     state: running
     autostart: "{{ vm_autostart }}"
+  when: vm_is_defined.rc != 0 or vm_is_defined.stdout is not search('State:\s*running')
