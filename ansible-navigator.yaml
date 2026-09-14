@@ -4,6 +4,24 @@ ansible-navigator:
     container-options:
       - --net=host
     image: quay.io/redhat-emea-ssa-team/hetzner-ocp4-ansible-ee:202603301213
+    # Most of this repo's outbound work - every DNS-provider call, the ACME
+    # exchange, the artifact download checks - runs `delegate_to: localhost`,
+    # which means it executes inside this container, not on the host. The
+    # container image ships no /etc/gai.conf, so it resolves IPv6-first
+    # regardless of how the host is configured.
+    #
+    # On a host whose IPv6 default route is dead that costs ~30s per AAAA
+    # record per call: 240s to HEAD one download URL, 723s to delete one DNS
+    # record. Mounting the host's gai.conf in makes the container inherit
+    # whatever prepare-host.yml decided, so the fix applies on both sides of
+    # the container boundary instead of only on the host.
+    #
+    # :ro because nothing in here should ever write to it, and :z so SELinux
+    # relabels it for container access.
+    volume-mounts:
+      - src: /etc/gai.conf
+        dest: /etc/gai.conf
+        options: ro,z
   logging:
     level: info
   mode: stdout
