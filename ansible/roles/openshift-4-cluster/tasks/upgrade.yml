@@ -257,19 +257,47 @@
         msg: "{{ (trigger_upgrade_pinned if openshift_upgrade_mode == 'pinned'
                   else trigger_upgrade_latest).stdout_lines | default([]) }}"
 
+    # The version the cluster was on before the trigger. The wait below needs
+    # it to tell "the new release finished" from "the old one is still the
+    # most recent completed entry".
+    - name: Record the pre-upgrade version
+      ansible.builtin.set_fact:
+        upgrade_version_before: "{{ cv_before_json.status.desired.version }}"
+
+    # Checking only `history[0].state == 'Completed'` is racy and silently
+    # skips the whole wait: for the first seconds after the trigger the CVO
+    # has not yet pushed its new Partial entry, so history[0] is still the
+    # *previous* release, already marked Completed - the condition matches on
+    # the first poll and the playbook charges on while the upgrade has barely
+    # begun. Observed on 4.19.45 -> 4.20.37: the play exited 11 minutes after
+    # triggering, an hour before the upgrade actually finished, "verified" a
+    # cluster that was ~10% through its rollout, and installed client
+    # binaries for the old version.
+    #
+    # Requiring the version to have *changed* removes the race, and
+    # Progressing=False keeps it from returning while the CVO is still
+    # settling the last operators.
     - name: Wait for upgrade to complete
       ansible.builtin.command: >
         {{ upgrade_oc_bin }} get clusterversion version -o json
         --kubeconfig {{ upgrade_kubeconfig_path }}
       register: upgrade_status
-      until: (upgrade_status.stdout | from_json).status.history[0].state == 'Completed'
+      until:
+        - (upgrade_status.stdout | from_json).status.history[0].state == 'Completed'
+        - (upgrade_status.stdout | from_json).status.history[0].version != upgrade_version_before
+        - ((upgrade_status.stdout | from_json).status.conditions
+           | selectattr('type', 'equalto', 'Progressing')
+           | map(attribute='status') | first | default('Unknown')) == 'False'
       retries: "{{ openshift_upgrade_wait_retries }}"
       delay: "{{ openshift_upgrade_wait_delay }}"
       changed_when: false
 
+    # history[0].version, not desired.version: desired can still name the old
+    # release early on, and after a completed upgrade history[0] is the
+    # authoritative record of what the cluster actually landed on.
     - name: Set resolved upgrade version
       ansible.builtin.set_fact:
-        upgrade_resolved_version: "{{ (upgrade_status.stdout | from_json).status.desired.version }}"
+        upgrade_resolved_version: "{{ (upgrade_status.stdout | from_json).status.history[0].version }}"
 
     - name: Upgrade complete
       ansible.builtin.debug:
