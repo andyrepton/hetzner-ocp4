@@ -5,3 +5,6 @@ ansible-navigator.log
 context/
 inventory/group_vars/all/vault
 ansible/RHEL*
+# openshift-install output dir (openshift_install_dir = artifacts_dir/cluster_name)
+# contains kubeconfig, kubeadmin-password and ignition files - never commit.
+/ocp/
