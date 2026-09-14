@@ -93,3 +93,9 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# Write /etc/gai.conf to prefer IPv4 when prepare-host.yml finds an IPv6
+# default route whose gateway does not answer. Set false to leave the host's
+# resolver ordering alone. Only takes effect when the gateway is genuinely
+# unreachable - a host with working IPv6 is never touched.
+prefer_ipv4_when_ipv6_gateway_dead: true

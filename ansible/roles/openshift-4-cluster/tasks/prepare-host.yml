@@ -25,6 +25,49 @@
   register: result
   failed_when: "result.rc != 0"
 
+# A host can have a global IPv6 address and an IPv6 default route whose
+# gateway never answers. Nothing reports this as broken: getaddrinfo() still
+# returns AAAA before A per RFC 3484, so every outbound connection to a
+# dual-stack host tries IPv6 first and blocks until the socket times out
+# before falling back to IPv4. It looks like slowness, never like an error.
+#
+# Measured on the Hetzner host this repo was built against, where
+# mirror.openshift.com has 4 A and 8 AAAA records:
+#   forced IPv4   0.35s   HTTP 200
+#   forced IPv6  34.9s    no response
+# 8 AAAA x ~30s gave 240s per URL in the installer's download checks - about
+# 32 minutes to HEAD-check eight files - and 723s per DNS record at the
+# provider, which made a cluster destroy take 26 minutes.
+#
+# Fixed at the host rather than per-task so it covers everything on the box,
+# not just Ansible. This only reorders getaddrinfo() results; IPv6 is not
+# disabled and starts being preferred again the moment the gateway works.
+- name: Check for an IPv6 default route
+  ansible.builtin.command: ip -6 route show default
+  register: prepare_host_v6_route
+  changed_when: false
+  failed_when: false
+
+- name: Test whether the IPv6 gateway actually answers
+  ansible.builtin.command: >-
+    ping6 -c2 -W2 {{ prepare_host_v6_route.stdout | regex_search('via (\S+)', '\1') | first }}
+  register: prepare_host_v6_ping
+  changed_when: false
+  failed_when: false
+  when: prepare_host_v6_route.stdout | length > 0
+
+- name: Prefer IPv4 when the IPv6 default route is dead
+  ansible.builtin.template:
+    src: gai.conf.j2
+    dest: /etc/gai.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - prefer_ipv4_when_ipv6_gateway_dead | default(true)
+    - prepare_host_v6_route.stdout | length > 0
+    - prepare_host_v6_ping.rc | default(0) != 0
+
 - name: Create SSH key for root
   ansible.builtin.user:
     name: root

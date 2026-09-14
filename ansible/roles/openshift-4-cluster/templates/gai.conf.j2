@@ -1,0 +1,26 @@
+{{ ansible_managed | comment }}
+#
+# Written by openshift-4-cluster/tasks/prepare-host.yml because this host has
+# an IPv6 default route whose gateway does not answer. See that file for the
+# measurements that motivated it.
+#
+# glibc replaces the entire built-in table as soon as any precedence line is
+# present, so the RFC 3484 defaults are restated here verbatim with one
+# change: IPv4-mapped addresses (::ffff:0:0/96) are raised from 10 to 100 so
+# getaddrinfo() returns A records ahead of AAAA.
+#
+# This does not disable IPv6. If the gateway starts answering, remove this
+# file (or set prefer_ipv4_when_ipv6_gateway_dead: false) and IPv6 is
+# preferred again on the next resolution.
+
+label  ::1/128       0
+label  ::/0          1
+label  2002::/16     2
+label  ::/96         3
+label  ::ffff:0:0/96 4
+
+precedence  ::1/128       50
+precedence  ::/0          40
+precedence  2002::/16     30
+precedence  ::/96         20
+precedence  ::ffff:0:0/96 100

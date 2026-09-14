@@ -3,10 +3,3 @@ le_certificates_dir: "{{ playbook_dir }}/../certificate"
 # Default staging directory
 # Production directory: https://acme-v02.api.letsencrypt.org/directory
 le_acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
-# Some hosts have a broken IPv6 default route (interface has a global IPv6
-# address, but the gateway never answers) while IPv4 works fine. When that
-# happens, every DNS-provider/ACME call in this role hangs indefinitely
-# trying the dead IPv6 route first. Set true (default) to make those calls
-# try IPv4 first via files/prefer-ipv4/sitecustomize.py on PYTHONPATH - this
-# only reorders results, it does not disable IPv6 or touch host config.
-le_prefer_ipv4: true
