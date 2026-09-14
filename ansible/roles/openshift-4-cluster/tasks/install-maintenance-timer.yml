@@ -57,11 +57,9 @@
     enabled: true
     state: started
 
-# noqa command-instead-of-module - list-timers is a query and the systemd
-# module has no equivalent; it only manages unit state. Printing the next
-# scheduled run is the whole point of this task, so there is nothing to
-# convert it to.
-- name: Report the timer schedule
+# list-timers is a query: the systemd module only manages unit state and has
+# no equivalent, so there is nothing to convert this to.
+- name: Report the timer schedule  # noqa command-instead-of-module
   ansible.builtin.command: >-
     systemctl list-timers openshift-4-maintenance-{{ cluster_name }}.timer --no-pager
   register: maint_timer_list
