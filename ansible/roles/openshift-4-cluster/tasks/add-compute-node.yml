@@ -73,7 +73,7 @@
 
 - name: Get host free memory
   ansible.builtin.setup:
-    gather_subset: ['!all', 'mem']
+    gather_subset: ['!all', 'hardware']
   check_mode: false
 
 - name: Evaluate pre-flight facts

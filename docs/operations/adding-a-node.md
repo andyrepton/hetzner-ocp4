@@ -65,7 +65,57 @@ playbook does not currently automate the reboot or the stale-object
 cleanup - do those two steps manually after it reports the reservation is
 in place.
 
-A second wrinkle, specific to these orphaned nodes: without a reservation
+A second wrinkle, and the one that actually blocks the adopt: **a renamed
+node keeps its old kubelet client certificate.** Booting under the correct
+hostname is not enough. The kubelet still presents the cert it was issued
+under its previous identity, so the API server lets it authenticate as the
+*old* name and then refuses to let it register as the new one:
+
+```
+Unable to register node with API server ... nodes "compute-2" not found
+csinodes "compute-2" is forbidden: User "system:node:localhost.localdomain"
+  can only access CSINode with the same name as the requesting node
+```
+
+No CSR is ever generated in this state, so the playbook's approval loop has
+nothing to approve and eventually times out waiting for Ready. The fix is to
+force a kubelet **re-bootstrap** on the node - move its current credentials
+aside and restart it, so it falls back to the bootstrap kubeconfig at
+`/etc/kubernetes/kubeconfig`:
+
+```bash
+ssh core@<node-ip> '
+  sudo systemctl stop kubelet
+  sudo mkdir -p /var/lib/kubelet/stale-creds.bak
+  sudo mv /var/lib/kubelet/kubeconfig /var/lib/kubelet/stale-creds.bak/
+  sudo mv /var/lib/kubelet/pki/kubelet-client-current.pem /var/lib/kubelet/stale-creds.bak/
+  sudo systemctl start kubelet'
+```
+
+It then issues a fresh `node-bootstrapper` CSR under the new name within a
+few seconds, and the normal two-round approval takes over. Move rather than
+delete, so the old credentials can be put back if something goes wrong. The
+playbook does not automate this yet - see the "fix node" work noted in the
+project plan.
+
+Two related cleanups are worth doing at the same time, because neither
+happens on its own. Pods scheduled on a deleted node object are **not**
+garbage-collected; they linger and keep the owning DaemonSet's desired-count
+too high, which shows up as a permanently `Progressing`/`Degraded` `network`
+or `dns` operator. Force-delete them:
+
+```bash
+oc get pods -A --field-selector spec.nodeName=<dead-node> --no-headers \
+  | awk '{print $1, $2}' \
+  | while read -r ns pod; do oc delete pod -n "$ns" "$pod" --force --grace-period=0; done
+```
+
+And a node that sat broken for a long time accumulates Pending
+`kubelet-serving` CSRs (96 of them on this cluster). They are harmless but
+noisy, and they make it much harder to see the CSRs you actually care about:
+delete any whose `spec.username` is `system:node:<dead-node>`.
+
+A third wrinkle, specific to these orphaned nodes: without a reservation
 they picked up a **dynamic** address from the DHCP pool (`.46`/`.47` on this
 cluster), not the deterministic one the formula above derives (`.15`/`.16`
 for those same ids). Adopting them changes their IP, not just their
