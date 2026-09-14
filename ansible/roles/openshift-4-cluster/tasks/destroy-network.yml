@@ -21,6 +21,13 @@
     pd_public_domain: "{{ cluster_name }}.{{ public_domain }}"
     pd_desec_zone: "{{ desec_zone }}"
     pd_desec_account_api_token: "{{ desec_account_api_token }}"
+  # See create-network.yml: without this the record deletions hang on a dead
+  # IPv6 route. This is where it was actually measured - 1446s to delete two
+  # Cloudflare records, 93% of the entire destroy.
+  environment:
+    PYTHONPATH: >-
+      {{ (([playbook_dir ~ '/roles/letsencrypt/files/prefer-ipv4'] if le_prefer_ipv4 | default(true) else [])
+      + ([ansible_env.PYTHONPATH] if (ansible_env.PYTHONPATH | default('')) else [])) | join(':') }}
   tags: public_dns
   when: dns_provider != 'none'
 
