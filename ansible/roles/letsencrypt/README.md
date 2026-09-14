@@ -35,6 +35,20 @@ Role Variables
 | le_public_domain | Use to create SAN certificate: `DNS:*.apps.{{ le_public_domain }},DNS:api.{{ le_public_domain }}` | cluster.domain.tld | non **required** |
 | le_certificates_dir | Here the certificates are stored  | `/root/certificates` | `{{ playbook_dir }}../certificate/` |
 | le_acme_directory | ACME Directory by default it use staging env because of https://letsencrypt.org/docs/rate-limits/ | `https://acme-v02.api.letsencrypt.org/directory` | `https://acme-staging-v02.api.letsencrypt.org/directory` |
+| le_prefer_ipv4 | Make DNS-provider/ACME API calls try IPv4 before IPv6. Set false to disable. See note below. | `false` | `true` |
+
+### `le_prefer_ipv4`
+
+Some hosts have a broken IPv6 default route (the interface carries a global
+IPv6 address, but the gateway never answers). When that happens, DNS
+providers and ACME endpoints that return both A and AAAA records can make
+every outbound call in this role hang indefinitely - the affected task
+looks stuck, but it's actually just retrying a dead IPv6 handshake over and
+over. `le_prefer_ipv4` (default `true`) reorders `getaddrinfo()` results so
+IPv4 is tried first, via a `sitecustomize.py` placed on `PYTHONPATH` for
+this role's tasks (`files/prefer-ipv4/`) - it doesn't disable IPv6 or touch
+host network configuration, so it's safe to leave enabled even on hosts
+where IPv6 works fine.
 
 Dependencies
 ------------
