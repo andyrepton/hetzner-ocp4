@@ -111,3 +111,14 @@ maintenance_clean_csrs: true
 # entirely but needs the QEMU guest agent, which these domains do not have.
 maintenance_ssh_key: "~/.ssh/id_rsa"
 maintenance_ssh_timeout: 10
+# Install a systemd timer that runs 09-maintenance.yml on a schedule. Off by
+# default - pass -e maintenance_install_timer=true once to set it up. Nothing
+# else in this repo ever reclaims qcow2 space, so without it the images grow
+# until the filesystem fills.
+maintenance_install_timer: false
+# systemd OnCalendar expression. Weekly on Sunday at 03:00 by default.
+maintenance_timer_schedule: "Sun *-*-* 03:00:00"
+# Jitter, so a host running several clusters does not trim them all at once.
+maintenance_timer_randomized_delay: "30m"
+# Upper bound on a single maintenance run.
+maintenance_timer_timeout: "45min"

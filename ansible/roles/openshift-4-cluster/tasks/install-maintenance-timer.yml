@@ -1,0 +1,72 @@
+---
+# Installs a systemd timer that runs 09-maintenance.yml on a schedule.
+#
+# The maintenance playbook is worth automating rather than remembering:
+# RHCOS does not enable fstrim.timer, so without something calling it the
+# qcow2 files only ever grow. On this host they had reached 116-118G each
+# against a 120G virtual size, filling the filesystem to 93% while the
+# guests were using about a quarter of that. A single pass reclaimed ~360G.
+# That is not a one-off - the same drift resumes immediately, and an upgrade
+# alone put 185G back within a day.
+#
+# Run standalone with:
+#   ./ansible/09-maintenance.yml --tags timer -e maintenance_install_timer=true
+
+- name: Locate ansible-navigator
+  ansible.builtin.command: which ansible-navigator
+  register: maint_navigator_which
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail if ansible-navigator is not on PATH
+  ansible.builtin.fail:
+    msg: >-
+      ansible-navigator not found on PATH, so the timer would install a unit
+      that cannot run. Install it, or set maintenance_ansible_navigator_bin
+      to its full path.
+  when:
+    - maint_navigator_which.rc != 0
+    - maintenance_ansible_navigator_bin is not defined
+
+- name: Set the navigator binary path for the unit
+  ansible.builtin.set_fact:
+    maintenance_ansible_navigator_bin: "{{ maintenance_ansible_navigator_bin
+      | default(maint_navigator_which.stdout | trim) }}"
+
+- name: Install maintenance systemd service
+  ansible.builtin.template:
+    src: maintenance.service.j2
+    dest: "/etc/systemd/system/openshift-4-maintenance-{{ cluster_name }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install maintenance systemd timer
+  ansible.builtin.template:
+    src: maintenance.timer.j2
+    dest: "/etc/systemd/system/openshift-4-maintenance-{{ cluster_name }}.timer"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start the maintenance timer
+  ansible.builtin.systemd:
+    name: "openshift-4-maintenance-{{ cluster_name }}.timer"
+    daemon_reload: true
+    enabled: true
+    state: started
+
+# noqa command-instead-of-module - list-timers is a query and the systemd
+# module has no equivalent; it only manages unit state. Printing the next
+# scheduled run is the whole point of this task, so there is nothing to
+# convert it to.
+- name: Report the timer schedule
+  ansible.builtin.command: >-
+    systemctl list-timers openshift-4-maintenance-{{ cluster_name }}.timer --no-pager
+  register: maint_timer_list
+  changed_when: false
+
+- name: Maintenance timer installed
+  ansible.builtin.debug:
+    msg: "{{ maint_timer_list.stdout_lines }}"

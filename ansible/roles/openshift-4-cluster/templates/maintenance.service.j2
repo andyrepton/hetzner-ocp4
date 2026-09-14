@@ -1,0 +1,28 @@
+{{ ansible_managed | comment }}
+#
+# Runs ansible/09-maintenance.yml on a schedule. Installed by
+# tasks/install-maintenance-timer.yml; see docs/operations/maintenance.md.
+#
+# Type=oneshot with the timer doing the scheduling - this unit is not meant
+# to be started at boot, only by maintenance.timer.
+
+[Unit]
+Description=OpenShift cluster maintenance for {{ cluster_name }} (fstrim, CSR cleanup)
+Documentation=file://{{ playbook_dir }}/../docs/operations/maintenance.md
+# Pointless before libvirt is up; the playbook reaches the guests over SSH.
+After=network-online.target virtqemud.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory={{ playbook_dir }}/..
+ExecStart={{ maintenance_ansible_navigator_bin }} run ansible/09-maintenance.yml -m stdout --pp never
+# The playbook never cordons, drains or reboots anything, so a long run is
+# inconvenient rather than dangerous - but do not let one wedge forever.
+TimeoutStartSec={{ maintenance_timer_timeout }}
+# fstrim on several guests is IO-heavy; stay out of the way of the cluster.
+IOSchedulingClass=idle
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

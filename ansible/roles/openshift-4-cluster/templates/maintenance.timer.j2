@@ -1,0 +1,18 @@
+{{ ansible_managed | comment }}
+#
+# Schedules maintenance.service. See docs/operations/maintenance.md.
+
+[Unit]
+Description=Run OpenShift cluster maintenance for {{ cluster_name }} on a schedule
+
+[Timer]
+OnCalendar={{ maintenance_timer_schedule }}
+# Run on boot if the machine was off when the timer was due, rather than
+# silently skipping until the next window.
+Persistent=true
+# Spread the start so a host running several clusters does not trim every
+# guest simultaneously.
+RandomizedDelaySec={{ maintenance_timer_randomized_delay }}
+
+[Install]
+WantedBy=timers.target

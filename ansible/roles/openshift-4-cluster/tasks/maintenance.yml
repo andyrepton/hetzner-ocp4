@@ -26,6 +26,18 @@
 # Read-only by default in the sense that it never touches cluster workloads:
 # no cordon, no drain, no reboot. Safe to run against a live cluster.
 
+# Optional: install the systemd timer that runs this playbook on a schedule,
+# then stop. Separated behind a flag so the normal run stays a pure
+# maintenance pass with no side effects on the host's unit files.
+- name: Install the maintenance timer
+  ansible.builtin.include_tasks: install-maintenance-timer.yml
+  when: maintenance_install_timer | default(false)
+  tags: timer
+
+- name: Stop after installing the timer
+  ansible.builtin.meta: end_play
+  when: maintenance_install_timer | default(false)
+
 - name: Locate openshift client for {{ openshift_version }}
   ansible.builtin.stat:
     path: "/opt/openshift-client-{{ openshift_version }}/oc"
