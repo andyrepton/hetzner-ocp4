@@ -28,6 +28,41 @@
   with_sequence: start=0 end="{{ compute_count|int - 1 if compute_count|int > 0 else 0 }}" stride=1
   when: compute_count > 0
 
+# The loops above are driven by master_count/compute_count, so they only
+# ever visit ids that are still configured. Anything outside that range -
+# a node removed with 07-remove-compute-node.yml, or left over from a run
+# with a larger count - is invisible to them and survives the destroy. This
+# sweep works from what is actually on disk instead, so "destroy" means the
+# cluster's artefacts are gone rather than "the ones I still have a count
+# for are gone".
+#
+# Deliberately scoped to this cluster's prefix: the RHCOS base images
+# (rhcos-*.qcow2) are shared and cached across rebuilds, and removing them
+# would force a multi-gigabyte re-download on every destroy.
+- name: Find leftover artefacts for this cluster
+  ansible.builtin.find:
+    paths: "{{ coreos_path }}"
+    patterns:
+      - "{{ cluster_name }}-*.qcow2"
+      - "{{ cluster_name }}-*.ign"
+  register: destroy_leftovers
+
+- name: Remove leftover artefacts for this cluster
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ destroy_leftovers.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Report leftover artefacts that were swept up
+  ansible.builtin.debug:
+    msg: >-
+      Removed {{ destroy_leftovers.files | length }} leftover file(s) the
+      count-driven loops did not cover:
+      {{ destroy_leftovers.files | map(attribute='path') | map('basename') | join(', ') }}
+  when: destroy_leftovers.files | length > 0
+
 - name: Destroy storage-nfs
   ansible.builtin.import_tasks: destroy-storage-nfs.yml
   when: storage_nfs == true
