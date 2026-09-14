@@ -101,6 +101,49 @@
       | map(attribute='status') | first | default('Unknown')) == 'True' }}"
     cv_not_progressing: "{{ (cv_before_json.status.conditions | selectattr('type', 'equalto', 'Progressing')
       | map(attribute='status') | first | default('Unknown')) == 'False' }}"
+    # Absent means "no objection" - the condition is only published when the
+    # CVO has something to say, so default to True rather than Unknown.
+    cv_upgradeable: "{{ (cv_before_json.status.conditions | selectattr('type', 'equalto', 'Upgradeable')
+      | map(attribute='status') | first | default('True')) != 'False' }}"
+    cv_upgradeable_message: "{{ cv_before_json.status.conditions | selectattr('type', 'equalto', 'Upgradeable')
+      | map(attribute='message') | first | default('') }}"
+
+# Upgradeable=False blocks *minor* upgrades only; z-stream updates are
+# explicitly still allowed while it is set. The usual cause is
+# AdminAckRequired - a deliberate human acknowledgement that a deprecated API
+# is being removed in the next minor, cleared with:
+#   oc patch configmap admin-acks -n openshift-config --type=merge \
+#     -p '{"data":{"<ack-key>":"true"}}'
+# The key is listed in the admin-gates configmap in openshift-config-managed.
+# Acknowledging it automatically here would defeat the point of the gate, so
+# this only refuses and explains.
+# split() rather than regex_replace() on purpose: inside a YAML folded block
+# a backslash is literal, so the '\\1' backreference idiom that works in a
+# double-quoted scalar silently yields the literal string "\1" for every
+# input - making any two versions compare equal and classifying a minor
+# upgrade as a z-stream. split() has no escaping to get wrong.
+#
+# In 'latest' mode the target is whatever the channel offers and is not known
+# until after `oc adm upgrade --to-latest`, so assume it may cross a minor
+# and let Upgradeable=False block it. That is the safe direction to err.
+- name: Classify the upgrade as minor or z-stream
+  ansible.builtin.set_fact:
+    upgrade_crosses_minor: >-
+      {{
+        true if openshift_upgrade_mode != 'pinned'
+        else (cv_before_json.status.desired.version.split('.')[0:2] | join('.'))
+             != (openshift_upgrade_target_version.split('.')[0:2] | join('.'))
+      }}
+
+- name: Warn if Upgradeable=False but this is only a z-stream
+  ansible.builtin.debug:
+    msg: >-
+      ClusterVersion reports Upgradeable=False ({{ cv_upgradeable_message }}).
+      That gates minor upgrades only, and this is a z-stream update, so it is
+      not blocking - but it will block the next minor upgrade until resolved.
+  when:
+    - not cv_upgradeable
+    - not upgrade_crosses_minor
 
 - name: Build list of pre-flight failures
   ansible.builtin.set_fact:
@@ -113,6 +156,9 @@
           if degraded_operators | length > 0 else [])
         + (['ClusterOperators unavailable: ' + (unavailable_operators | join(', '))]
           if unavailable_operators | length > 0 else [])
+        + (['ClusterVersion reports Upgradeable=False, which blocks minor upgrades: '
+            ~ cv_upgradeable_message]
+          if (not cv_upgradeable) and upgrade_crosses_minor else [])
         + (['etcd is unhealthy (member(s) unavailable)'] if 'etcd' in degraded_operators else [])
         + (['Nodes not Ready: ' + (not_ready_nodes | join(', '))] if not_ready_nodes | length > 0 else [])
         + (['Only ' ~ disk_free_gb ~ 'G free on ' ~ coreos_path ~ ', need at least '
