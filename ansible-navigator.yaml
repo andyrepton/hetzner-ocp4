@@ -16,12 +16,15 @@ ansible-navigator:
     # whatever prepare-host.yml decided, so the fix applies on both sides of
     # the container boundary instead of only on the host.
     #
-    # :ro because nothing in here should ever write to it, and :z so SELinux
-    # relabels it for container access.
+    # :ro because nothing in here should ever write to it. Deliberately no
+    # :z - podman refuses to relabel anything under /etc ("SELinux
+    # relabeling of /etc is not allowed") and the file's default label is
+    # already readable from the container, so the plain read-only bind is
+    # both sufficient and the only thing that works.
     volume-mounts:
       - src: /etc/gai.conf
         dest: /etc/gai.conf
-        options: ro,z
+        options: ro
   logging:
     level: info
   mode: stdout

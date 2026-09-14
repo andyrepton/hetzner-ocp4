@@ -95,11 +95,14 @@ ansible-navigator:
     volume-mounts:
       - src: /etc/gai.conf
         dest: /etc/gai.conf
-        options: ro,z
+        options: ro
 ```
 
-`ro` because nothing should ever write to it, and `z` so SELinux relabels it
-for container access. With that in place, one decision made by
+`ro` because nothing should ever write to it. Note there is deliberately no
+`z`: podman refuses to relabel anything under `/etc` ("SELinux relabeling of
+/etc is not allowed") and the file's default label is already readable from
+the container, so a plain read-only bind is both sufficient and the only
+thing that works. With that in place, one decision made by
 `prepare-host.yml` applies on both sides of the container boundary.
 
 This was found the hard way: after the original per-task `PYTHONPATH` shim
