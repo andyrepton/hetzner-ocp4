@@ -55,6 +55,33 @@ openshift_location: " {{ openshift_mirror }}/pub/openshift-v4/clients/ocp/{{ ope
 openshift_install_command: "/usr/local/bin/openshift-install"
 
 opm_download_url: "{{ openshift_location }}/opm-linux-rhel9.tar.gz"
+# --- Upgrade settings (used by tasks/upgrade.yml / 05-upgrade-cluster.yml) ---
+# "pinned" upgrades to openshift_upgrade_target_version; "latest" upgrades to
+# the latest recommended update on the cluster's current channel.
+openshift_upgrade_mode: pinned
+openshift_upgrade_target_version: "{{ openshift_version }}"
+# Channel to switch the cluster to before upgrading, e.g. "stable-4.19".
+# Left empty by default - keeps whatever channel the cluster is already on
+# rather than assuming.
+openshift_upgrade_channel: ""
+# Set true to upgrade even when pre-flight health checks fail (degraded
+# ClusterOperators, not-Ready nodes, etc). Prefer fixing the underlying
+# issue first - see docs/operations/upgrading.md.
+openshift_upgrade_force: false
+# Set true when upgrading to a version outside the cluster's current
+# recommended update graph (equivalent to `oc adm upgrade --allow-explicit-upgrade`).
+openshift_upgrade_allow_explicit_upgrade: false
+# How long to wait for the upgrade to finish: retries * delay seconds.
+# Defaults to 2 hours.
+openshift_upgrade_wait_retries: 120
+openshift_upgrade_wait_delay: 60
+# Minimum free space required on coreos_path before starting an upgrade.
+openshift_upgrade_min_free_disk_gb: 50
+
+# reference to coreos qcow file
+coreos_version: 4.18.1
+coreos_download_url: "{{ openshift_mirror }}/pub/openshift-v4/dependencies/rhcos/{{ coreos_version.split('.')[:2]|join('.') }}/{{ coreos_version }}/rhcos-{{coreos_version}}-x86_64-qemu.x86_64.qcow2.gz"  # noqa line-length
+coreos_csum_url: "{{ openshift_mirror }}/pub/openshift-v4/dependencies/rhcos/{{ coreos_version.split('.')[:2]|join('.') }}/{{ coreos_version }}/sha256sum.txt"  # noqa line-length
 
 # Path to store coreos image
 coreos_path: /var/lib/libvirt/images

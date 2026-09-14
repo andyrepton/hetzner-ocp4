@@ -301,6 +301,7 @@ In our setup, this will be `ansible/group_vars` and `ansible/host_vars`.
 * [How to install OKD](docs/how-to-install-okd.md)
 * [Virsh commands cheatsheet to manage KVM guest virtual machines](https://computingforgeeks.com/virsh-commands-cheatsheet/)
 * [Remote execution, run the playbooks on your laptop](docs/remote-execution.md)
+* [How to upgrade a running cluster](docs/operations/upgrading.md)
 
 
 # Playbook overview
@@ -312,6 +313,7 @@ In our setup, this will be `ansible/group_vars` and `ansible/host_vars`.
 |`ansible/02-create-cluster.yml`|Installation of your OpenShift 4 Cluster|
 |`ansible/03-stop-cluster.yml`|Stop all virtual machines related to your OpenShift 4 Cluster|
 |`ansible/04-start-cluster.yml`|Start all virtual machines related to your OpenShift 4 Cluster|
+|`ansible/05-upgrade-cluster.yml`|Upgrade your running OpenShift 4 Cluster in place. See [docs/operations/upgrading.md](docs/operations/upgrading.md)|
 |`ansible/99-destroy-cluster.yml`|Delete everything what is created via `ansible/02-create-cluster.yml`|
 |`ansible/renewal-certificate.yml`|Renewal your Let's encrypt certificate and replace everything in your OpenShift 4 Cluster. There is no automatically renew process, please run renew on your own behalf.|
 |`ansible/run-add-ons.yml`|Run all enabled add-ons agains your OpenShift 4 cluster|

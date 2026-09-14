@@ -1,0 +1,291 @@
+---
+# In-place upgrade of an already-running cluster, driven by `oc adm upgrade`
+# against the cluster's own update graph.
+#
+# This does NOT touch any libvirt VM, ignition file or RHCOS image, and does
+# NOT manage the Machine Config Operator directly: once triggered, the
+# Cluster Version Operator and MCO roll the new release out to the existing
+# control-plane and compute nodes in place.
+#
+# Modes (openshift_upgrade_mode):
+#   pinned (default) - upgrade to openshift_upgrade_target_version
+#   latest            - upgrade to the latest recommended update on the
+#                        cluster's current (or openshift_upgrade_channel-set)
+#                        channel
+#
+# Run with `--check` to execute pre-flight checks only and see what would
+# happen, without triggering anything.
+
+- name: Locate existing oc client
+  ansible.builtin.command: which oc
+  register: oc_which
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Fail if oc is not on PATH
+  ansible.builtin.fail:
+    msg: >-
+      No 'oc' binary found on PATH - run 02-create-cluster.yml (or
+      download-openshift-artifacts.yml) first so a client is available to
+      drive the upgrade.
+  when: oc_which.rc != 0
+
+- name: Check kubeconfig exists for {{ cluster_name }}
+  ansible.builtin.stat:
+    path: "{{ openshift_install_dir }}/auth/kubeconfig"
+  register: upgrade_kubeconfig
+  check_mode: false
+
+- name: Fail if no kubeconfig was found
+  ansible.builtin.fail:
+    msg: >-
+      No kubeconfig found at {{ openshift_install_dir }}/auth/kubeconfig.
+      This playbook upgrades an already-installed cluster - run
+      02-create-cluster.yml first.
+  when: not upgrade_kubeconfig.stat.exists
+
+- name: Set oc invocation facts
+  ansible.builtin.set_fact:
+    upgrade_oc_bin: "{{ oc_which.stdout }}"
+    upgrade_kubeconfig_path: "{{ openshift_install_dir }}/auth/kubeconfig"
+
+###############################################################################
+# Pre-flight: all of these must pass before anything mutates the cluster.
+###############################################################################
+
+- name: Get current ClusterVersion
+  ansible.builtin.command: >
+    {{ upgrade_oc_bin }} get clusterversion version -o json
+    --kubeconfig {{ upgrade_kubeconfig_path }}
+  register: cv_before
+  changed_when: false
+  check_mode: false
+
+- name: Get ClusterOperators
+  ansible.builtin.command: >
+    {{ upgrade_oc_bin }} get clusteroperators -o json
+    --kubeconfig {{ upgrade_kubeconfig_path }}
+  register: co_before
+  changed_when: false
+  check_mode: false
+
+- name: Get Nodes
+  ansible.builtin.command: >
+    {{ upgrade_oc_bin }} get nodes -o json
+    --kubeconfig {{ upgrade_kubeconfig_path }}
+  register: nodes_before
+  changed_when: false
+  check_mode: false
+
+- name: Check free disk space on {{ coreos_path }}
+  ansible.builtin.command: "df --output=avail -B G {{ coreos_path }}"
+  register: disk_free
+  changed_when: false
+  check_mode: false
+
+- name: Evaluate pre-flight facts
+  ansible.builtin.set_fact:
+    cv_before_json: "{{ cv_before.stdout | from_json }}"
+    degraded_operators: "{{ (co_before.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Degraded' && status=='True']].metadata.name\") }}"
+    unavailable_operators: "{{ (co_before.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Available' && status=='False']].metadata.name\") }}"
+    not_ready_nodes: "{{ (nodes_before.stdout | from_json)
+      | json_query(\"items[?status.conditions[?type=='Ready' && status!='True']].metadata.name\") }}"
+    disk_free_gb: "{{ (disk_free.stdout_lines[-1] | regex_replace('[^0-9]', '')) | int }}"
+
+- name: Evaluate ClusterVersion conditions
+  ansible.builtin.set_fact:
+    cv_available: "{{ (cv_before_json.status.conditions | selectattr('type', 'equalto', 'Available')
+      | map(attribute='status') | first | default('Unknown')) == 'True' }}"
+    cv_not_progressing: "{{ (cv_before_json.status.conditions | selectattr('type', 'equalto', 'Progressing')
+      | map(attribute='status') | first | default('Unknown')) == 'False' }}"
+
+- name: Build list of pre-flight failures
+  ansible.builtin.set_fact:
+    preflight_failures: >-
+      {{
+        ([] if cv_available else ['ClusterVersion Available condition is not True'])
+        + ([] if cv_not_progressing else
+          ['ClusterVersion is Progressing - an update is already in flight, refusing to start another'])
+        + (['ClusterOperators degraded: ' + (degraded_operators | join(', '))]
+          if degraded_operators | length > 0 else [])
+        + (['ClusterOperators unavailable: ' + (unavailable_operators | join(', '))]
+          if unavailable_operators | length > 0 else [])
+        + (['etcd is unhealthy (member(s) unavailable)'] if 'etcd' in degraded_operators else [])
+        + (['Nodes not Ready: ' + (not_ready_nodes | join(', '))] if not_ready_nodes | length > 0 else [])
+        + (['Only ' ~ disk_free_gb ~ 'G free on ' ~ coreos_path ~ ', need at least '
+          ~ openshift_upgrade_min_free_disk_gb ~ 'G']
+          if disk_free_gb | int < openshift_upgrade_min_free_disk_gb | int else [])
+      }}
+
+- name: Report pre-flight status
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Pre-flight checks passed: cluster is healthy at ' ~ cv_before_json.status.desired.version ~ '.'
+         if preflight_failures | length == 0
+         else 'Pre-flight checks FAILED: ' ~ (preflight_failures | join(' | ')) }}
+
+- name: Refuse to start - pre-flight checks failed
+  ansible.builtin.fail:
+    msg: >-
+      Refusing to upgrade: {{ preflight_failures | join('; ') }}.
+      Resolve the underlying issue(s) first - or re-run with
+      -e openshift_upgrade_force=true to override (not recommended: an
+      upgrade started against an unhealthy cluster can make recovery
+      significantly harder).
+  when:
+    - preflight_failures | length > 0
+    - not openshift_upgrade_force
+
+- name: Pre-flight only - stop here in --check mode
+  ansible.builtin.debug:
+    msg: "--check requested: pre-flight only, no changes made."
+  when: ansible_check_mode
+
+###############################################################################
+# Upgrade
+###############################################################################
+
+- name: Determine whether an upgrade is needed
+  ansible.builtin.set_fact:
+    upgrade_needed: "{{ true if openshift_upgrade_mode == 'latest'
+      else (cv_before_json.status.desired.version != openshift_upgrade_target_version) }}"
+
+- name: Already at target version
+  ansible.builtin.debug:
+    msg: "Cluster is already at {{ openshift_upgrade_target_version }}, nothing to do."
+  when:
+    - not ansible_check_mode
+    - not upgrade_needed
+
+- name: Perform upgrade
+  when:
+    - not ansible_check_mode
+    - upgrade_needed
+  block:
+
+    - name: Set update channel to {{ openshift_upgrade_channel }}
+      ansible.builtin.command:
+        argv:
+          - "{{ upgrade_oc_bin }}"
+          - adm
+          - upgrade
+          - channel
+          - "{{ openshift_upgrade_channel }}"
+          - --kubeconfig
+          - "{{ upgrade_kubeconfig_path }}"
+      register: set_channel
+      changed_when: "'Requested update channel' in set_channel.stdout"
+      when: openshift_upgrade_channel | length > 0
+
+    - name: "Trigger upgrade: pinned to {{ openshift_upgrade_target_version }}"
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [upgrade_oc_bin, 'adm', 'upgrade', '--to=' ~ openshift_upgrade_target_version,
+             '--kubeconfig', upgrade_kubeconfig_path]
+            + (['--allow-explicit-upgrade'] if openshift_upgrade_allow_explicit_upgrade else [])
+            + (['--force'] if openshift_upgrade_force else [])
+          }}
+      register: trigger_upgrade
+      when: openshift_upgrade_mode == 'pinned'
+
+    - name: "Trigger upgrade: latest update in current channel"
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [upgrade_oc_bin, 'adm', 'upgrade', '--to-latest=true', '--kubeconfig', upgrade_kubeconfig_path]
+            + (['--force'] if openshift_upgrade_force else [])
+          }}
+      register: trigger_upgrade
+      when: openshift_upgrade_mode == 'latest'
+
+    - name: Upgrade triggered
+      ansible.builtin.debug:
+        msg: "{{ trigger_upgrade.stdout_lines }}"
+
+    - name: Wait for upgrade to complete
+      ansible.builtin.command: >
+        {{ upgrade_oc_bin }} get clusterversion version -o json
+        --kubeconfig {{ upgrade_kubeconfig_path }}
+      register: upgrade_status
+      until: (upgrade_status.stdout | from_json).status.history[0].state == 'Completed'
+      retries: "{{ openshift_upgrade_wait_retries }}"
+      delay: "{{ openshift_upgrade_wait_delay }}"
+      changed_when: false
+
+    - name: Set resolved upgrade version
+      ansible.builtin.set_fact:
+        upgrade_resolved_version: "{{ (upgrade_status.stdout | from_json).status.desired.version }}"
+
+    - name: Upgrade complete
+      ansible.builtin.debug:
+        msg: "Cluster successfully upgraded to {{ upgrade_resolved_version }}."
+
+    ###########################################################################
+    # Post-upgrade: re-verify, then re-sync the local oc/openshift-install
+    # binaries. These are pinned by openshift_version at install time and go
+    # stale after an in-cluster upgrade - stale binaries then break future
+    # certificate renewals and node additions that shell out to them, so this
+    # is not optional cleanup.
+    ###########################################################################
+
+    - name: Post-upgrade - get ClusterOperators
+      ansible.builtin.command: >
+        {{ upgrade_oc_bin }} get clusteroperators -o json
+        --kubeconfig {{ upgrade_kubeconfig_path }}
+      register: co_after
+      changed_when: false
+
+    - name: Post-upgrade - get Nodes
+      ansible.builtin.command: >
+        {{ upgrade_oc_bin }} get nodes -o json
+        --kubeconfig {{ upgrade_kubeconfig_path }}
+      register: nodes_after
+      changed_when: false
+
+    - name: Evaluate post-upgrade facts
+      ansible.builtin.set_fact:
+        degraded_operators_after: "{{ (co_after.stdout | from_json)
+          | json_query(\"items[?status.conditions[?type=='Degraded' && status=='True']].metadata.name\") }}"
+        not_ready_nodes_after: "{{ (nodes_after.stdout | from_json)
+          | json_query(\"items[?status.conditions[?type=='Ready' && status!='True']].metadata.name\") }}"
+
+    - name: Report post-upgrade status
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Post-upgrade: all ClusterOperators healthy, all Nodes Ready.'
+             if (degraded_operators_after | length == 0 and not_ready_nodes_after | length == 0)
+             else 'Post-upgrade: still settling - degraded operators: '
+               ~ (degraded_operators_after | join(', ') or 'none') ~ '; not-ready nodes: '
+               ~ (not_ready_nodes_after | join(', ') or 'none')
+               ~ '. This can be normal for a few minutes after an upgrade; re-check with `oc get co,nodes`'
+               ~ ' if it persists.' }}
+
+    - name: Download oc/openshift-install clients for {{ upgrade_resolved_version }}
+      ansible.builtin.include_tasks: download-oc-client.yml
+      vars:
+        upgrade_target_version: "{{ upgrade_resolved_version }}"
+
+    - name: Point /usr/local/bin at the client binaries for {{ upgrade_resolved_version }}
+      ansible.builtin.file:
+        src: "{{ item.value }}"
+        dest: "{{ item.key }}"
+        state: link
+        force: yes
+        follow: false
+      with_dict:
+        "/usr/local/bin/oc": "/opt/openshift-client-{{ upgrade_resolved_version }}/oc"
+        "/usr/local/bin/kubectl": "/opt/openshift-client-{{ upgrade_resolved_version }}/kubectl"
+        "/usr/local/bin/openshift-install": "/opt/openshift-install-{{ upgrade_resolved_version }}/openshift-install"
+
+    - name: Resync complete
+      ansible.builtin.debug:
+        msg: >-
+          Local oc/openshift-install binaries now point at
+          {{ upgrade_resolved_version }}. If openshift_version in cluster.yml
+          still says {{ openshift_version }}, update it to match so future
+          runs of this repo (certificate renewal, adding nodes) stay
+          consistent with the cluster's actual version.

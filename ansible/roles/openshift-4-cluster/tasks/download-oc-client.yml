@@ -1,0 +1,56 @@
+---
+# Downloads only the openshift-install and oc/kubectl client binaries for
+# {{ upgrade_target_version }}. Used by upgrade.yml - unlike
+# download-openshift-artifacts.yml this intentionally skips the RHCOS image,
+# opm, helm, butane and oc-mirror, none of which are needed to drive an
+# in-place cluster upgrade.
+
+- name: Set client download url for {{ upgrade_target_version }}
+  ansible.builtin.set_fact:
+    upgrade_openshift_location: "{{ openshift_mirror }}/pub/openshift-v4/clients/ocp/{{ upgrade_target_version }}"
+
+- name: Check upgrade client download urls
+  ansible.builtin.uri:
+    method: HEAD
+    url: "{{ item }}"
+    status_code:
+      - 200
+      # Forbidden because of github forwards to aws s3.
+      # HEAD request to S3 is forbidden
+      - 403
+  with_items:
+    - "{{ upgrade_openshift_location }}/openshift-install-linux-{{ upgrade_target_version }}.tar.gz"
+    - "{{ upgrade_openshift_location }}/openshift-client-linux-{{ upgrade_target_version }}.tar.gz"
+
+- name: Create client directories for {{ upgrade_target_version }}
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: u+rwx,g+rx,o+rx
+  with_items:
+    - "/opt/openshift-install-{{ upgrade_target_version }}"
+    - "/opt/openshift-client-{{ upgrade_target_version }}"
+
+- name: Download OpenShift installer {{ upgrade_target_version }}
+  ansible.builtin.unarchive:
+    src: "{{ upgrade_openshift_location }}/openshift-install-linux-{{ upgrade_target_version }}.tar.gz"
+    dest: "/opt/openshift-install-{{ upgrade_target_version }}/"
+    remote_src: yes
+    mode: u+rwx,g+rx,o+rx
+    owner: root
+    group: root
+    exclude:
+      - 'README.md'
+    creates: "/opt/openshift-install-{{ upgrade_target_version }}/openshift-install"
+
+- name: Download OpenShift client {{ upgrade_target_version }}
+  ansible.builtin.unarchive:
+    src: "{{ upgrade_openshift_location }}/openshift-client-linux-{{ upgrade_target_version }}.tar.gz"
+    dest: "/opt/openshift-client-{{ upgrade_target_version }}/"
+    remote_src: yes
+    mode: u+rwx,g+rx,o+rx
+    owner: root
+    group: root
+    exclude:
+      - 'README.md'
+    creates: "/opt/openshift-client-{{ upgrade_target_version }}/oc"

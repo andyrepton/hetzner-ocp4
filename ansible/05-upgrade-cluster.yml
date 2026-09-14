@@ -1,0 +1,18 @@
+---
+# Upgrades the already-running cluster in-place. See
+# docs/operations/upgrading.md for the required variables and pre-flight
+# behaviour.
+#
+# Usage:
+#   ./ansible/05-upgrade-cluster.yml            # upgrade
+#   ./ansible/05-upgrade-cluster.yml --check     # pre-flight checks only
+- hosts: host
+  gather_facts: true
+  vars_files:
+    - ../cluster.yml
+
+  tasks:
+    - name: Upgrade cluster
+      ansible.builtin.import_role:
+        name: openshift-4-cluster
+        tasks_from: upgrade.yml
