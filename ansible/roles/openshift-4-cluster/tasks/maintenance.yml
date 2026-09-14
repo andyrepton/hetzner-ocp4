@@ -1,0 +1,202 @@
+---
+# Host-side housekeeping for a running cluster. Everything here was first
+# done by hand on 2026-09-14 while recovering this cluster; the point of the
+# playbook is that none of it should ever need doing by hand again.
+#
+# Three jobs, each independently switchable:
+#
+#   1. fstrim inside every running guest. The domains are defined with
+#      discard='unmap', so a trim propagates through to the host and shrinks
+#      the backing qcow2 - but RHCOS does not enable fstrim.timer, so nothing
+#      ever ran it. The seven qcow2 files had grown to 116-118G each against
+#      a 120G virtual size while the guests were using ~25% internally,
+#      filling /var/lib/libvirt/images to 93%. One pass took the host to 44%
+#      and reclaimed ~360G, with no downtime.
+#
+#   2. Prune unused container images on the nodes. Kubelet only garbage
+#      collects images once a node crosses its image-gc-high-threshold (85%
+#      by default), so a node can sit indefinitely at 82% with tens of GB of
+#      superseded release images. One master here held 192 images / 79G.
+#
+#   3. Delete Pending CSRs belonging to nodes that no longer exist. A node
+#      that was broken for a long time keeps requesting certificates; this
+#      cluster had accumulated 96 of them, which is harmless but buries the
+#      CSRs you actually need to see when adding a node.
+#
+# Read-only by default in the sense that it never touches cluster workloads:
+# no cordon, no drain, no reboot. Safe to run against a live cluster.
+
+- name: Locate openshift client for {{ openshift_version }}
+  ansible.builtin.stat:
+    path: "/opt/openshift-client-{{ openshift_version }}/oc"
+  register: maint_oc_stat
+  check_mode: false
+
+- name: Fail if the openshift client is missing
+  ansible.builtin.fail:
+    msg: >-
+      /opt/openshift-client-{{ openshift_version }}/oc not found - run
+      02-create-cluster.yml first.
+  when: not maint_oc_stat.stat.exists
+
+- name: Set oc invocation facts
+  ansible.builtin.set_fact:
+    maint_oc: "/opt/openshift-client-{{ openshift_version }}/oc --kubeconfig {{ openshift_install_dir }}/auth/kubeconfig"
+    maint_ssh: >-
+      ssh -i {{ maintenance_ssh_key }} -o BatchMode=yes
+      -o StrictHostKeyChecking=no -o ConnectTimeout={{ maintenance_ssh_timeout }}
+
+###############################################################################
+# Work out which guests are running, and where they are
+###############################################################################
+
+- name: List running libvirt domains
+  ansible.builtin.command: "virsh list --name --state-running"
+  register: maint_running_domains
+  changed_when: false
+  check_mode: false
+
+- name: Get nodes with their internal addresses
+  ansible.builtin.command: "{{ maint_oc }} get nodes -o json"
+  register: maint_nodes
+  changed_when: false
+  check_mode: false
+
+- name: Build the list of reachable node addresses
+  ansible.builtin.set_fact:
+    maint_node_ips: "{{ (maint_nodes.stdout | from_json)
+      | json_query('items[].status.addresses[?type==`InternalIP`].address[]') }}"
+
+- name: Report disk usage before
+  ansible.builtin.command: "df -h {{ coreos_path }}"
+  register: maint_disk_before
+  changed_when: false
+  check_mode: false
+
+###############################################################################
+# 1. fstrim - reclaim qcow2 space back to the host
+###############################################################################
+
+- name: Reclaim guest free space with fstrim
+  when:
+    - maintenance_fstrim
+    - not ansible_check_mode
+  block:
+
+    - name: Run fstrim inside each node
+      ansible.builtin.command: "{{ maint_ssh }} core@{{ item }} 'sudo fstrim -a'"
+      loop: "{{ maint_node_ips }}"
+      loop_control:
+        label: "{{ item }}"
+      register: maint_fstrim
+      changed_when: true
+      # A node that is mid-reboot or otherwise unreachable must not abort the
+      # whole run - the remaining nodes are still worth trimming, and the
+      # summary below reports which ones were missed.
+      failed_when: false
+
+    - name: Report nodes that could not be trimmed
+      ansible.builtin.debug:
+        msg: >-
+          fstrim could not reach: {{ maint_fstrim.results
+            | selectattr('rc', 'ne', 0) | map(attribute='item') | list | join(', ') }}.
+          Re-run once they are back; nothing else was affected.
+      when: maint_fstrim.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+###############################################################################
+# 2. Prune unused container images on the nodes
+###############################################################################
+
+- name: Prune unused container images
+  when:
+    - maintenance_prune_images
+    - not ansible_check_mode
+  block:
+
+    - name: Run crictl image prune on each node
+      ansible.builtin.command: "{{ maint_ssh }} core@{{ item }} 'sudo crictl rmi --prune'"
+      loop: "{{ maint_node_ips }}"
+      loop_control:
+        label: "{{ item }}"
+      register: maint_prune
+      changed_when: true
+      # crictl returns non-zero when CRI-O is busy deleting and a request
+      # times out, even though the deletions it did make still took effect.
+      failed_when: false
+
+###############################################################################
+# 3. Delete Pending CSRs for nodes that no longer exist
+###############################################################################
+
+- name: Clean up orphaned CSRs
+  when:
+    - maintenance_clean_csrs
+    - not ansible_check_mode
+  block:
+
+    # Plain `oc get csr` output rather than -o json: the CONDITION column
+    # already distinguishes Pending from Approved, and filtering on a flat
+    # "name username" pair avoids the nested-attribute filtering that breaks
+    # when a Pending CSR has no .status.conditions key at all.
+    - name: Get Pending node CSRs
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          {{ maint_oc }} get csr --no-headers
+          | awk '$NF == "Pending" && $4 ~ /^system:node:/ {print $1, $4}'
+      register: maint_pending_csrs
+      changed_when: false
+
+    - name: Build the list of current node CSR subjects
+      ansible.builtin.set_fact:
+        maint_known_subjects: "{{ (maint_nodes.stdout | from_json)
+          | json_query('items[].metadata.name')
+          | map('regex_replace', '^', 'system:node:') | list }}"
+
+    # Only CSRs whose subject names a node that is not in the cluster.
+    # Approved CSRs are historical records the controller cleans up on its
+    # own, and a Pending CSR for a *current* node may simply be waiting for
+    # approval right now - deleting either would be wrong.
+    - name: Select Pending CSRs belonging to nodes that no longer exist
+      ansible.builtin.set_fact:
+        maint_orphan_csrs: >-
+          {{ maint_pending_csrs.stdout_lines
+             | map('split', ' ')
+             | rejectattr('1', 'in', maint_known_subjects)
+             | map(attribute='0') | list }}
+
+    - name: Delete orphaned CSRs
+      ansible.builtin.command: "{{ maint_oc }} delete csr {{ maint_orphan_csrs | join(' ') }}"
+      when: maint_orphan_csrs | length > 0
+      changed_when: true
+
+    - name: Report orphaned CSR cleanup
+      ansible.builtin.debug:
+        msg: >-
+          {{ maint_orphan_csrs | length }} Pending CSR(s) belonging to
+          non-existent nodes were deleted.
+      when: maint_orphan_csrs | length > 0
+
+###############################################################################
+# Summary
+###############################################################################
+
+- name: Report disk usage after
+  ansible.builtin.command: "df -h {{ coreos_path }}"
+  register: maint_disk_after
+  changed_when: false
+  check_mode: false
+
+- name: Maintenance summary
+  ansible.builtin.debug:
+    msg:
+      - "Before: {{ maint_disk_before.stdout_lines[-1] }}"
+      - "After:  {{ maint_disk_after.stdout_lines[-1] }}"
+      # The outer parentheses matter: the | filter binds tighter than +, so
+      # without them join() applies only to the last list and the result is a
+      # list + str concatenation, which raises at template time.
+      - >-
+        Ran: {{ ((['fstrim'] if maintenance_fstrim else [])
+                 + (['image prune'] if maintenance_prune_images else [])
+                 + (['CSR cleanup'] if maintenance_clean_csrs else []))
+                | join(', ') or 'nothing (all tasks disabled)' }}

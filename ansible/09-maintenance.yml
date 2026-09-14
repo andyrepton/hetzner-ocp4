@@ -1,0 +1,22 @@
+---
+# Host-side housekeeping for a running cluster: reclaim qcow2 space with
+# fstrim, optionally prune unused container images, and delete Pending CSRs
+# left behind by nodes that no longer exist. See docs/operations/maintenance.md.
+#
+# Never cordons, drains or reboots anything - safe against a live cluster.
+#
+# Usage:
+#   ./ansible/09-maintenance.yml
+#   ./ansible/09-maintenance.yml -e maintenance_prune_images=true
+#   ./ansible/09-maintenance.yml --check      # report only, change nothing
+- name: Run cluster maintenance
+  hosts: host
+  gather_facts: true
+  vars_files:
+    - ../cluster.yml
+
+  tasks:
+    - name: Cluster maintenance
+      ansible.builtin.import_role:
+        name: openshift-4-cluster
+        tasks_from: maintenance.yml

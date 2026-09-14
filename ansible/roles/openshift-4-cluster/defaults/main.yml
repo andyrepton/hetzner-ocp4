@@ -93,3 +93,21 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# --- Maintenance settings (used by tasks/maintenance.yml / 09-maintenance.yml) ---
+# Run `fstrim -a` inside each running node. The domains use discard='unmap',
+# so this propagates through and shrinks the backing qcow2 on the host -
+# RHCOS does not enable fstrim.timer, so nothing else ever does it.
+maintenance_fstrim: true
+# Run `crictl rmi --prune` on each node. Off by default: kubelet already
+# garbage-collects images above its 85% threshold, and pruning forces a
+# re-pull of anything not currently running. Worth enabling before an
+# upgrade, which pulls a whole new release payload onto every node.
+maintenance_prune_images: false
+# Delete Pending CSRs whose system:node:<name> subject names a node that is
+# no longer in the cluster.
+maintenance_clean_csrs: true
+# How the maintenance tasks reach the nodes. virsh domfstrim would avoid SSH
+# entirely but needs the QEMU guest agent, which these domains do not have.
+maintenance_ssh_key: "~/.ssh/id_rsa"
+maintenance_ssh_timeout: 10
