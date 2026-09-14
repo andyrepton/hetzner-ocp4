@@ -93,3 +93,16 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# --- Remove-compute-node settings (used by tasks/remove-compute-node.yml / 07-remove-compute-node.yml) ---
+# Set true to remove a node even when it would drop the cluster below
+# remove_node_min_remaining_workers. Prefer adding capacity first.
+remove_node_force: false
+# Refuse to remove a node if fewer than this many workers would remain.
+remove_node_min_remaining_workers: 1
+# Passed to `oc adm drain --timeout`.
+remove_node_drain_timeout: "300s"
+# Default is to leave the VM's disk in place after undefine - set true to
+# `virsh undefine --remove-all-storage` instead. Deliberately off by
+# default; this is the one truly irreversible step in this playbook.
+remove_node_destroy_storage: false

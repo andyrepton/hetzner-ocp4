@@ -1,0 +1,18 @@
+---
+# Removes one compute node from an already-running cluster. See
+# docs/operations/removing-a-node.md.
+#
+# Usage:
+#   ./ansible/07-remove-compute-node.yml -e remove_node_name=compute-2
+#   ./ansible/07-remove-compute-node.yml -e remove_node_name=compute-2 --check
+- name: Remove a compute node from the cluster
+  hosts: host
+  gather_facts: true
+  vars_files:
+    - ../cluster.yml
+
+  tasks:
+    - name: Remove compute node
+      ansible.builtin.import_role:
+        name: openshift-4-cluster
+        tasks_from: remove-compute-node.yml

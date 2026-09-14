@@ -1,0 +1,287 @@
+---
+# Removes one compute node from an already-running cluster. See
+# docs/operations/removing-a-node.md.
+#
+# Scoped to compute nodes only - refuses outright on anything carrying a
+# master/control-plane label, and refuses on any node name that doesn't
+# match the compute-<id> naming scheme this repo uses (an irregular name
+# like localhost.localdomain needs manual cleanup, not this playbook - see
+# docs/operations/adding-a-node.md for how that happens).
+#
+# Run with --check to see exactly what would be drained and destroyed,
+# without mutating anything.
+
+- name: Require remove_node_name explicitly
+  ansible.builtin.fail:
+    msg: >-
+      remove_node_name is required, e.g.
+      -e remove_node_name=compute-2. No default, no "remove the last one".
+  when: remove_node_name is not defined or remove_node_name | length == 0
+
+- name: Refuse on IPv6/dual-stack clusters (not yet supported by this playbook)
+  ansible.builtin.fail:
+    msg: >-
+      ip_families includes IPv6 ({{ ip_families }}). This playbook only
+      removes the IPv4 DHCP reservation/haproxy backend - see the same
+      limitation noted in docs/operations/adding-a-node.md.
+  when: "'IPv6' in ip_families"
+
+- name: Locate openshift client for {{ openshift_version }}
+  ansible.builtin.stat:
+    path: "/opt/openshift-client-{{ openshift_version }}/oc"
+  register: remove_node_oc_stat
+  check_mode: false
+
+- name: Fail if the openshift client is missing
+  ansible.builtin.fail:
+    msg: >-
+      /opt/openshift-client-{{ openshift_version }}/oc not found - run
+      02-create-cluster.yml first.
+  when: not remove_node_oc_stat.stat.exists
+
+- name: Set oc invocation facts
+  ansible.builtin.set_fact:
+    remove_node_oc: "/opt/openshift-client-{{ openshift_version }}/oc --kubeconfig {{ openshift_install_dir }}/auth/kubeconfig"
+
+###############################################################################
+# Validate the target
+###############################################################################
+
+- name: Get the target node
+  ansible.builtin.command: "{{ remove_node_oc }} get node {{ remove_node_name }} -o json"
+  register: remove_node_get
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fail if the node doesn't exist
+  ansible.builtin.fail:
+    msg: "No node named {{ remove_node_name }} in this cluster."
+  when: remove_node_get.rc != 0
+
+- name: Parse target node
+  ansible.builtin.set_fact:
+    remove_node_json: "{{ remove_node_get.stdout | from_json }}"
+    remove_node_master_labels: "{{ remove_node_get.stdout | from_json
+      | json_query(\"metadata.labels | keys(@)\")
+      | select('match', '.*(master|control-plane).*') | list }}"
+
+- name: Refuse to operate on masters/control-plane nodes
+  ansible.builtin.fail:
+    msg: >-
+      {{ remove_node_name }} carries a master/control-plane label
+      ({{ remove_node_master_labels }}). This playbook is scoped to
+      compute nodes only - control-plane removal means etcd member
+      management and quorum risk, which on a 3-node control plane is a
+      footgun not worth automating. Not overridable by remove_node_force.
+  when: remove_node_master_labels | length > 0
+
+- name: Refuse on a node name outside the compute-<id> naming scheme
+  ansible.builtin.fail:
+    msg: >-
+      {{ remove_node_name }} doesn't match the compute-<id> naming scheme
+      this repo uses, so its libvirt domain/DHCP reservation can't be
+      reliably derived. This is very likely an orphaned node (see
+      docs/operations/adding-a-node.md for how that happens) - clean it up
+      manually: `oc delete node {{ remove_node_name }}` plus the matching
+      `virsh destroy`/`virsh undefine` once you've confirmed which VM it
+      actually is.
+  when: not (remove_node_name is match('^compute-[0-9]+$'))
+
+- name: Set derived identity
+  ansible.builtin.set_fact:
+    remove_node_domain: "{{ cluster_name }}-{{ remove_node_name }}"
+
+###############################################################################
+# Pre-flight: worker count safety
+###############################################################################
+
+- name: Get all Nodes
+  ansible.builtin.command: "{{ remove_node_oc }} get nodes -o json"
+  register: remove_node_all_nodes
+  changed_when: false
+  check_mode: false
+
+- name: Evaluate remaining worker count after removal
+  ansible.builtin.set_fact:
+    remove_node_worker_count_after: "{{ ((remove_node_all_nodes.stdout | from_json)
+      | json_query(\"items[?!(contains(keys(metadata.labels), 'node-role.kubernetes.io/master')
+        || contains(keys(metadata.labels), 'node-role.kubernetes.io/control-plane'))].metadata.name\")
+      | difference([remove_node_name])) | length }}"
+
+- name: Refuse if removal drops below the safe worker count
+  ansible.builtin.fail:
+    msg: >-
+      Removing {{ remove_node_name }} would leave only
+      {{ remove_node_worker_count_after }} worker(s), below
+      remove_node_min_remaining_workers ({{ remove_node_min_remaining_workers }}).
+      Re-run with -e remove_node_force=true to override.
+  when:
+    - remove_node_worker_count_after | int < remove_node_min_remaining_workers | int
+    - not remove_node_force
+
+- name: Report what would happen
+  ansible.builtin.debug:
+    msg: >-
+      Would cordon+drain {{ remove_node_name }}, delete the node object,
+      destroy+undefine libvirt domain {{ remove_node_domain }}
+      ({{ 'including its storage' if remove_node_destroy_storage else 'leaving its disk in place' }}),
+      remove its DHCP reservation, and rebuild the haproxy backend list.
+      {{ remove_node_worker_count_after }} worker(s) would remain.
+
+- name: Stop here in --check mode
+  ansible.builtin.debug:
+    msg: "--check requested: no changes made."
+  when: ansible_check_mode
+
+###############################################################################
+# Cordon, drain, delete the node object
+###############################################################################
+
+- name: Cordon and drain {{ remove_node_name }}
+  when: not ansible_check_mode
+  block:
+
+    - name: Cordon {{ remove_node_name }}
+      ansible.builtin.command: "{{ remove_node_oc }} adm cordon {{ remove_node_name }}"
+      changed_when: true
+
+    - name: Drain {{ remove_node_name }}
+      ansible.builtin.command: >
+        {{ remove_node_oc }} adm drain {{ remove_node_name }}
+        --ignore-daemonsets --delete-emptydir-data
+        --timeout={{ remove_node_drain_timeout }}
+      changed_when: true
+
+    - name: Delete node object {{ remove_node_name }}
+      ansible.builtin.command: "{{ remove_node_oc }} delete node {{ remove_node_name }}"
+      changed_when: true
+
+###############################################################################
+# Destroy the VM
+###############################################################################
+
+- name: Destroy VM
+  when: not ansible_check_mode
+  block:
+
+    - name: Check whether the VM is running
+      ansible.builtin.command: "virsh domstate {{ remove_node_domain }}"
+      register: remove_node_domstate
+      changed_when: false
+      failed_when: false
+
+    - name: Stop {{ remove_node_domain }}
+      ansible.builtin.command: "virsh destroy {{ remove_node_domain }}"
+      when: remove_node_domstate.rc == 0 and 'running' in remove_node_domstate.stdout
+
+    - name: Undefine, leaving storage in place, {{ remove_node_domain }}
+      ansible.builtin.command: "virsh undefine {{ remove_node_domain }}"
+      when:
+        - remove_node_domstate.rc == 0
+        - not remove_node_destroy_storage
+
+    - name: Undefine, removing storage, {{ remove_node_domain }}
+      ansible.builtin.command: "virsh undefine {{ remove_node_domain }} --remove-all-storage"
+      when:
+        - remove_node_domstate.rc == 0
+        - remove_node_destroy_storage
+
+###############################################################################
+# Remove the DHCP reservation
+###############################################################################
+
+- name: Remove DHCP reservation
+  when: not ansible_check_mode
+  block:
+
+    - name: Get live network config
+      ansible.builtin.command: "virsh net-dumpxml {{ cluster_name }}"
+      register: remove_node_net_xml
+      changed_when: false
+
+    - name: Extract the existing reservation entry for {{ remove_node_domain }}
+      ansible.builtin.set_fact:
+        remove_node_dhcp_entry: "{{ remove_node_net_xml.stdout
+          | regex_findall(\"<host [^>]*name='\" ~ remove_node_name ~ '\\.'
+            ~ (vn_internal_domain | regex_escape) ~ \"'[^>]*/>\") | first | default('') }}"
+
+    - name: Remove the DHCP reservation, verified live
+      ansible.builtin.command: >
+        virsh net-update {{ cluster_name }} delete ip-dhcp-host
+        "{{ remove_node_dhcp_entry }}"
+        --live --config
+      when: remove_node_dhcp_entry | length > 0
+
+###############################################################################
+# Rebuild the haproxy backend list from observed state
+###############################################################################
+
+- name: Rebuild haproxy backend list from observed state
+  when: not ansible_check_mode
+  block:
+
+    - name: List remaining compute VMs
+      ansible.builtin.command: "virsh list --all --name"
+      register: remove_node_virsh_list_after
+      changed_when: false
+
+    - name: Derive haproxy node list from observed state
+      ansible.builtin.set_fact:
+        remove_node_lb_compute_ids: "{{ (remove_node_virsh_list_after.stdout_lines
+          | select('match', '^' ~ cluster_name ~ '-compute-[0-9]+$')
+          | map('regex_replace', '^' ~ cluster_name ~ '-compute-([0-9]+)$', '\\1') | map('int') | list) | unique | sort }}"
+
+    - name: Build masters list for haproxy template
+      ansible.builtin.set_fact:
+        remove_node_lb_masters: "{{ remove_node_lb_masters | default([]) + [{
+          'name': 'master-' ~ item,
+          'ipv4': vn_subnet.split('.')[:3] | join('.') ~ '.' ~ (10 + item|int),
+          }] }}"
+      loop: "{{ range(0, master_count|int) | list }}"
+
+    - name: Build workers list for haproxy template
+      ansible.builtin.set_fact:
+        remove_node_lb_workers: "{{ remove_node_lb_workers | default([]) + [{
+          'name': 'compute-' ~ item,
+          'ipv4': vn_subnet.split('.')[:3] | join('.') ~ '.' ~ (10 + master_count|int + item|int),
+          }] }}"
+      loop: "{{ remove_node_lb_compute_ids }}"
+
+    - name: Set nodes fact for haproxy template
+      ansible.builtin.set_fact:
+        nodes:
+          bootstrap: []
+          masters: "{{ remove_node_lb_masters }}"
+          workers: "{{ remove_node_lb_workers }}"
+
+    - name: Build IPv4 listen facts (matches create-network.yml)
+      ansible.builtin.set_fact:
+        ipv4_listen_private:
+          - "{{ vn_subnet.split('.')[:3] | join('.') }}.1"
+        ipv4_listen_public:
+          - "{{ listen_address }}"
+      when: "'IPv4' in ip_families"
+
+    - name: Render haproxy config from observed state
+      ansible.builtin.set_fact:
+        remove_node_lb_haproxy_cfg: "{{ lookup('template', 'templates/haproxy.conf.j2') }}"
+
+    - name: Write haproxy EnvironmentFile
+      ansible.builtin.copy:
+        content: "HAPROXY_CFG=\"{{ remove_node_lb_haproxy_cfg }}\"\n"
+        dest: "/etc/sysconfig/openshift-4-loadbalancer-{{ cluster_name }}.env"
+        mode: '0644'
+      # Only restarts (briefly drops in-flight connections through
+      # 80/443/6443) when the rendered config actually changed - see
+      # handlers/main.yml.
+      notify: Restart load balancer
+
+- name: Removal complete
+  ansible.builtin.debug:
+    msg: >-
+      {{ remove_node_name }} removed: node object deleted, VM
+      {{ remove_node_domain }} destroyed and undefined
+      ({{ 'storage removed' if remove_node_destroy_storage else 'storage left in place' }}),
+      DHCP reservation and haproxy backend removed.
+  when: not ansible_check_mode
