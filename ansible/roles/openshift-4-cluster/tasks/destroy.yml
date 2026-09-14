@@ -75,3 +75,23 @@
     state: absent
     path: "{{ openshift_install_dir }}/"
   tags: ignition
+
+# A rebuilt cluster reuses the same addresses, but every VM generates fresh
+# host keys on first boot. Left behind, the old keys make the next SSH to
+# each node fail with REMOTE HOST IDENTIFICATION HAS CHANGED - which looks
+# alarming, is easy to mistake for something serious, and blocks any
+# key-checked automation until someone clears them by hand.
+#
+# Scoped to this cluster's own subnet so nothing else in known_hosts is
+# touched. ssh-keygen -R is idempotent: removing an absent entry is a no-op,
+# so this is safe on a host that never had them.
+- name: Remove this cluster's host keys from known_hosts
+  ansible.builtin.known_hosts:
+    name: "{{ item }}"
+    state: absent
+  loop: "{{ [vn_subnet | regex_replace('\\.[0-9]+$', '')]
+            | product(range(2, 2 + (master_count | int) + (compute_count | int) + 10))
+            | map('join', '.') | list }}"
+  loop_control:
+    label: "{{ item }}"
+  failed_when: false
