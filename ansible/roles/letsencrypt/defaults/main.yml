@@ -3,3 +3,9 @@ le_certificates_dir: "{{ playbook_dir }}/../certificate"
 # Default staging directory
 # Production directory: https://acme-v02.api.letsencrypt.org/directory
 le_acme_directory: "https://acme-staging-v02.api.letsencrypt.org/directory"
+# Ceiling, not a floor: propagation polling (every 5s, via
+# community.general.dig against the host's normal resolver) returns as soon
+# as the challenge TXT records actually show up, so this is only how long
+# we're willing to wait before giving up - not a fixed sleep applied every
+# run.
+le_dns_propagation_timeout: 300

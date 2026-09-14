@@ -155,9 +155,15 @@
     - le_dns_provider in ['hetzner', 'digitalocean', 'cloudflare', 'desec']
     - sample_com_challenge is changed
 
-- name: Pause, wait for DNS changes
-  ansible.builtin.pause:   # noqa no-handler
-    seconds: 300
+- name: Wait for ACME challenge TXT records to propagate  # noqa no-handler
+  delegate_to: localhost
+  ansible.builtin.debug:
+    msg: "{{ lookup('community.general.dig', item.key ~ './TXT') }}"
+  register: dig_result
+  until: item.value[0] in dig_result.msg
+  retries: "{{ le_dns_propagation_timeout | int // 5 }}"
+  delay: 5
+  loop: "{{ challenge_data_dns | default({}) | dict2items }}"
   when: sample_com_challenge is changed
 
 - name: Let the challenge be validated and retrieve the cert and intermediate certificate

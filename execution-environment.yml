@@ -34,6 +34,9 @@ dependencies:
   python:
     - libvirt-python
     - jmespath
+    # Required by community.general.dig, used by the letsencrypt role to poll
+    # for ACME challenge TXT records instead of sleeping a fixed 300s.
+    - dnspython
   system: 
     - libvirt-client
     - libvirt-libs
