@@ -129,6 +129,29 @@
   tags:
     - storage
 
+# The registry defaults to a single replica, so it goes offline for the few
+# minutes its node is draining - during every upgrade, every node resize, and
+# any manual drain. Anything pushing or pulling from the internal registry at
+# that moment fails, which is a poor surprise mid-demo.
+#
+# The backing volume is NFS and already ReadWriteMany, so a second replica
+# needs no storage change at all; only the replica count was holding it to
+# one. Two replicas on a 3-worker cluster means a drain always leaves one
+# serving.
+- name: Set image registry replica count to {{ image_registry_replicas }}
+  # yamllint disable rule:line-length
+  ansible.builtin.command: |
+    /opt/openshift-client-{{ openshift_version }}/oc patch configs.imageregistry.operator.openshift.io cluster --type='merge' -p='{"spec":{"replicas":{{ image_registry_replicas }}}}' --kubeconfig {{ openshift_install_dir }}/auth/kubeconfig
+  # yamllint enable rule:line-length
+  register: registry_replicas_status
+  retries: 10
+  delay: 15
+  until: registry_replicas_status.rc == 0
+  changed_when: true
+  when: image_registry_replicas | int > 1
+  tags:
+    - storage
+
 - name: Adjust directory permissions
   ansible.builtin.file:
     path: "{{ storage_nfs_path_prefix }}/{{ cluster_name }}-pv-{{ item }}"
