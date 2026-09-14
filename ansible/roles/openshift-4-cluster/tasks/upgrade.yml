@@ -343,12 +343,42 @@
                ~ '. This can be normal for a few minutes after an upgrade; re-check with `oc get co,nodes`'
                ~ ' if it persists.' }}
 
-    - name: Download oc/openshift-install clients for {{ upgrade_resolved_version }}
+###############################################################################
+# Re-sync the local oc/openshift-install binaries to whatever the cluster is
+# actually running.
+#
+# Deliberately OUTSIDE the "Perform upgrade" block. Gating it on
+# upgrade_needed meant the playbook could only fix binaries for an upgrade it
+# had just performed itself - so when an earlier run installed the wrong
+# version (see the wait-condition race above), re-running could not correct
+# it, because by then the cluster was already at the target and the whole
+# block was skipped. Reconciling against observed cluster state rather than
+# against "did I just upgrade" makes this self-healing and idempotent.
+###############################################################################
+
+- name: Re-read ClusterVersion for the client resync
+  ansible.builtin.command: >
+    {{ upgrade_oc_bin }} get clusterversion version -o json
+    --kubeconfig {{ upgrade_kubeconfig_path }}
+  register: cv_for_resync
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Determine the version the clients should match
+  ansible.builtin.set_fact:
+    upgrade_client_version: "{{ (cv_for_resync.stdout | from_json).status.history[0].version }}"
+  when: not ansible_check_mode
+
+- name: Client resync
+  when: not ansible_check_mode
+  block:
+
+    - name: Download oc/openshift-install clients for {{ upgrade_client_version }}
       ansible.builtin.include_tasks: download-oc-client.yml
       vars:
-        upgrade_target_version: "{{ upgrade_resolved_version }}"
+        upgrade_target_version: "{{ upgrade_client_version }}"
 
-    - name: Point /usr/local/bin at the client binaries for {{ upgrade_resolved_version }}
+    - name: Point /usr/local/bin at the client binaries for {{ upgrade_client_version }}
       ansible.builtin.file:
         src: "{{ item.value }}"
         dest: "{{ item.key }}"
@@ -356,15 +386,15 @@
         force: yes
         follow: false
       with_dict:
-        "/usr/local/bin/oc": "/opt/openshift-client-{{ upgrade_resolved_version }}/oc"
-        "/usr/local/bin/kubectl": "/opt/openshift-client-{{ upgrade_resolved_version }}/kubectl"
-        "/usr/local/bin/openshift-install": "/opt/openshift-install-{{ upgrade_resolved_version }}/openshift-install"
+        "/usr/local/bin/oc": "/opt/openshift-client-{{ upgrade_client_version }}/oc"
+        "/usr/local/bin/kubectl": "/opt/openshift-client-{{ upgrade_client_version }}/kubectl"
+        "/usr/local/bin/openshift-install": "/opt/openshift-install-{{ upgrade_client_version }}/openshift-install"
 
     - name: Resync complete
       ansible.builtin.debug:
         msg: >-
           Local oc/openshift-install binaries now point at
-          {{ upgrade_resolved_version }}. If openshift_version in cluster.yml
+          {{ upgrade_client_version }}. If openshift_version in cluster.yml
           still says {{ openshift_version }}, update it to match so future
           runs of this repo (certificate renewal, adding nodes) stay
           consistent with the cluster's actual version.
