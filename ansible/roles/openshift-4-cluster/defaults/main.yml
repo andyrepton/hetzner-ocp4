@@ -93,3 +93,15 @@ add_ons_enabled: false
 
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
+
+# --- Start-cluster verification (used by tasks/start.yml / 04-start-cluster.yml) ---
+# After starting the VMs, wait until the cluster is genuinely usable rather
+# than reporting success as soon as libvirt has powered them on. Set false to
+# start the VMs and return immediately.
+start_cluster_wait: true
+# retries x delay: API 10s, nodes 10s, operators 15s. Measured recovery on a
+# 6-node cluster was 73s to all-Ready, so these are generous ceilings rather
+# than expected durations.
+start_cluster_api_retries: 60
+start_cluster_node_retries: 60
+start_cluster_operator_retries: 80
