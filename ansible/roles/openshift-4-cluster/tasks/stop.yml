@@ -26,6 +26,12 @@
   ignore_errors: yes
   with_items: "{{ vms }}"
 
+# 60 x 10s rather than 10 x 10s. A node that is busy, or has a unit that is
+# slow to stop, can take several minutes to finish an ACPI shutdown: measured
+# on a 6-node 4.22 cluster the last VMs did not reach "shut off" until 161s,
+# and one worker on the same host once took over twelve minutes. The old 100s
+# ceiling failed the play while the guests were shutting down perfectly
+# normally, leaving a half-stopped cluster and a confusing error.
 - name: "Check VM state"
   community.libvirt.virt:
     name: "{{ item }}"
@@ -33,7 +39,7 @@
   register: result
   until: result.status == 'shutdown'
   delay: 10
-  retries: "10"
+  retries: 60
   with_items: "{{ vms }}"
 
 - name: Stop OpenShift 4 load balancer
