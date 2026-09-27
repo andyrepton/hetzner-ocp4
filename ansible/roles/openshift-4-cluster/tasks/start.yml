@@ -35,11 +35,6 @@
 # exactly the wrong answer after a power cut - the one time someone needs to
 # know whether the cluster really came back.
 #
-# Measured on this host after a full stop/start of a 6-node 4.22 cluster:
-#   12s   VMs running
-#   73s   all nodes Ready, all ClusterOperators healthy
-#   157s  workload fully restored (214 running pods, matching the baseline)
-#
 # Three separate gates, because each can pass while the next is still false -
 # operators reported healthy at 73s when fewer than half the pods were back.
 ###############################################################################
