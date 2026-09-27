@@ -129,15 +129,6 @@
   tags:
     - storage
 
-# The registry defaults to a single replica, so it goes offline for the few
-# minutes its node is draining - during every upgrade, every node resize, and
-# any manual drain. Anything pushing or pulling from the internal registry at
-# that moment fails, which is a poor surprise mid-demo.
-#
-# The backing volume is NFS and already ReadWriteMany, so a second replica
-# needs no storage change at all; only the replica count was holding it to
-# one. Two replicas on a 3-worker cluster means a drain always leaves one
-# serving.
 - name: Set image registry replica count to {{ image_registry_replicas }}
   # yamllint disable rule:line-length
   ansible.builtin.command: |

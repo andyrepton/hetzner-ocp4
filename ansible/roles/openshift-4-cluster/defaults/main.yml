@@ -94,9 +94,11 @@ add_ons_enabled: false
 # Internal use only, to use an adjusted ignition config.
 ignition_filename_appendix: ""
 
-# Replica count for the internal image registry. The default of 1 means the
-# registry is unavailable while its node drains - on every upgrade, resize or
-# manual drain. The NFS-backed volume is ReadWriteMany, so more than one
-# replica needs no storage change. Only applied when storage_nfs is enabled,
-# since that is what provides the RWX volume.
-image_registry_replicas: 2
+# Replica count for the internal image registry, sized to the topology. A
+# single-node cluster has nowhere to schedule a second replica, so it stays
+# at 1; every larger topology gets 2 so the registry survives one node
+# draining - on every upgrade, resize or manual drain. The NFS-backed volume
+# is ReadWriteMany, so more than one replica needs no storage change. Only
+# applied when storage_nfs is enabled, since that is what provides the RWX
+# volume.
+image_registry_replicas: "{{ 1 if (master_count | int + compute_count | int) <= 1 else 2 }}"
