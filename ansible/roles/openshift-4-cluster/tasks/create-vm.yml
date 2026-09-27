@@ -37,8 +37,14 @@
     remote_src: true
     mode: '0644'
 
+# community.libvirt.virt's `status` command raises (fail_json) rather than
+# returning a clean rc when the domain isn't defined at all, so that failure
+# is the "not defined" signal here - `.status` is only present in the result
+# when the lookup succeeded.
 - name: Check if vm is already defined
-  ansible.builtin.command: "virsh dominfo {{ vm_instance_name }}"
+  community.libvirt.virt:
+    name: "{{ vm_instance_name }}"
+    command: status
   register: vm_is_defined
   changed_when: false
   failed_when: false
@@ -48,18 +54,18 @@
     src: "vm.xml.j2"
     dest: "/tmp/{{ vm_instance_name }}.virt.xml"
     mode: 0664
-  when: vm_is_defined.rc != 0
+  when: vm_is_defined.status is not defined
 
 - name: Define VirtualMachine {{ vm_instance_name }}
   community.libvirt.virt:
     name: "{{ vm_instance_name }}"
     command: define
     xml: "{{ lookup('template', 'templates/vm.xml.j2') }}"
-  when: vm_is_defined.rc != 0
+  when: vm_is_defined.status is not defined
 
 - name: Start VirtualMachine {{ vm_instance_name }}
   community.libvirt.virt:
     name: "{{ vm_instance_name }}"
     state: running
     autostart: "{{ vm_autostart }}"
-  when: vm_is_defined.rc != 0 or vm_is_defined.stdout is not search('State:\s*running')
+  when: vm_is_defined.status | default('') != 'running'
